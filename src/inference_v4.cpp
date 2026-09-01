@@ -2,9 +2,11 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -19,68 +21,14 @@ static bool u32v(const gguf::Value*v,uint32_t&o){if(!v||v->bytes.size()<4)return
 static bool bv(const gguf::Value*v,bool&o){if(!v||v->type!=gguf::Type::BOOL||v->bytes.empty())return false;o=v->bytes[0]!=0;return true;}
 static TensorBinding find(const gguf::Model&m,const std::string&n){for(const auto&t:m.tensors())if(t.name==n)return{&t,m.data(t)};return{};}
 static TensorBinding alt(const gguf::Model&m,const std::string&a,const std::string&b=""){auto x=find(m,a);return x.tensor?x:find(m,b);}
-static float elem(const TensorBinding&t,size_t i){if(!t.tensor||!t.data) return 0;auto ty=t.tensor->type;if(ty==gguf::TensorType::F32){float x;std::memcpy(&x,t.data+i*4,4);return x;}if(ty==gguf::TensorType::F16){uint16_t x;std::memcpy(&x,t.data+i*2,2);return hf(x);}size_t b=i/32,j=i%32,bs=(ty==gguf::TensorType::Q8_0?34:(ty==gguf::TensorType::Q4_0||ty==gguf::TensorType::Q4_1?18:22));const uint8_t*p=t.data+b*bs;uint16_t dh;std::memcpy(&dh,p,2);float d=hf(dh);if(ty==gguf::TensorType::Q8_0)return d*(int8_t)p[2+j];if(ty==gguf::TensorType::Q4_0||ty==gguf::TensorType::Q4_1){uint16_t mh=0;if(ty==gguf::TensorType::Q4_1)std::memcpy(&mh,p+2,2);const uint8_t*q=p+(ty==gguf::TensorType::Q4_1?4:2);int z=(j&1)?q[j/2]>>4:q[j/2]&15;return ty==gguf::TensorType::Q4_1?d*z+hf(mh):d*(z-8);}uint32_t qh;std::memcpy(&qh,p+2,4);const uint8_t*q=p+6;int z=(j&1)?q[j/2]>>4:q[j/2]&15;z|=((qh>>j)&1)<<4;if(ty==gguf::TensorType::Q5_1){uint16_t mh;std::memcpy(&mh,p+2,2);return d*z+hf(mh);}return d*(z-16);}
+static float elem(const TensorBinding&t,size_t i){if(!t.tensor||!t.data)return 0;auto ty=t.tensor->type;if(ty==gguf::TensorType::F32){float x;std::memcpy(&x,t.data+i*4,4);return x;}if(ty==gguf::TensorType::F16){uint16_t x;std::memcpy(&x,t.data+i*2,2);return hf(x);}size_t b=i/32,j=i%32,bs=(ty==gguf::TensorType::Q8_0?34:(ty==gguf::TensorType::Q4_0||ty==gguf::TensorType::Q4_1?18:22));const uint8_t*p=t.data+b*bs;uint16_t dh;std::memcpy(&dh,p,2);float d=hf(dh);if(ty==gguf::TensorType::Q8_0)return d*(int8_t)p[2+j];if(ty==gguf::TensorType::Q4_0||ty==gguf::TensorType::Q4_1){uint16_t mh=0;if(ty==gguf::TensorType::Q4_1)std::memcpy(&mh,p+2,2);const uint8_t*q=p+(ty==gguf::TensorType::Q4_1?4:2);int z=(j&1)?q[j/2]>>4:q[j/2]&15;return ty==gguf::TensorType::Q4_1?d*z+hf(mh):d*(z-8);}uint32_t qh;std::memcpy(&qh,p+2,4);const uint8_t*q=p+6;int z=(j&1)?q[j/2]>>4:q[j/2]&15;z|=((qh>>j)&1)<<4;if(ty==gguf::TensorType::Q5_1){uint16_t mh;std::memcpy(&mh,p+2,2);return d*z+hf(mh);}return d*(z-16);}
 
-// The transformer performs many large matrix-vector products.  Each output
-// row is independent, so split the rows over exactly three persistent worker
-// threads for the default Pi 2B 75% CPU policy.  The main thread participates
-// as a worker too only for very small matrices; large inference GEMVs use the
-// three worker threads below.  Threads are created once and reused per call.
-class MVWorkers {
-    std::array<std::thread,3> workers_;
-    std::mutex mutex_;
-    std::condition_variable cv_;
-    std::condition_variable done_;
-    const TensorBinding* w_=nullptr;
-    const float* x_=nullptr;
-    float* y_=nullptr;
-    size_t r_=0,c_=0,next_=0,active_=0,generation_=0;
-    bool stop_=false;
-public:
-    MVWorkers(){
-        for(auto&i:workers_) i=std::thread([this]{run();});
-    }
-    ~MVWorkers(){
-        {std::lock_guard<std::mutex>lk(mutex_);stop_=true;}
-        cv_.notify_all();
-        for(auto&i:workers_) if(i.joinable()) i.join();
-    }
-    void run(){
-        size_t seen=0;
-        for(;;){
-            std::unique_lock<std::mutex>lk(mutex_);
-            cv_.wait(lk,[&]{return stop_||generation_!=seen;});
-            if(stop_) return;
-            seen=generation_;
-            const TensorBinding*w=w_; const float*x=x_; float*y=y_; size_t r=r_,c=c_;
-            lk.unlock();
-            for(;;){
-                size_t i;
-                {std::lock_guard<std::mutex>g(mutex_); if(next_>=r) break; i=next_++;}
-                double s=0.0;
-                for(size_t j=0;j<c;j++) s+=(double)elem(*w,i*c+j)*x[j];
-                y[i]=(float)s;
-            }
-            lk.lock();
-            if(active_>0 && --active_==0) done_.notify_one();
-        }
-    }
-    void run_mv(const TensorBinding&w,const float*x,float*y,size_t r,size_t c){
-        if(r<64){
-            for(size_t i=0;i<r;i++){double s=0.0;for(size_t j=0;j<c;j++)s+=(double)elem(w,i*c+j)*x[j];y[i]=(float)s;}
-            return;
-        }
-        {
-            std::lock_guard<std::mutex>lk(mutex_);
-            w_=&w;x_=x;y_=y;r_=r;c_=c;next_=0;active_=workers_.size();++generation_;
-        }
-        cv_.notify_all();
-        std::unique_lock<std::mutex>lk(mutex_);
-        done_.wait(lk,[&]{return active_==0;});
-    }
-};
+// Three persistent workers are used for the large GEMV operations in the
+// transformer. Each worker claims independent output rows, giving the Pi 2B
+// a default 3/4-core inference workload without launching threads per token.
+class MVWorkers{std::array<std::thread,3>workers_;std::mutex mu_;std::condition_variable cv_,done_;const TensorBinding*w_=nullptr;const float*x_=nullptr;float*y_=nullptr;size_t r_=0,c_=0,next_=0,active_=0,generation_=0;bool stop_=false;void worker(){size_t seen=0;for(;;){std::unique_lock<std::mutex>lk(mu_);cv_.wait(lk,[&]{return stop_||generation_!=seen;});if(stop_)return;seen=generation_;const TensorBinding*w=w_;const float*x=x_;float*y=y_;size_t r=r_,c=c_;lk.unlock();for(;;){size_t i;{std::lock_guard<std::mutex>g(mu_);if(next_>=r)break;i=next_++;}double s=0.0;for(size_t j=0;j<c;j++)s+=(double)elem(*w,i*c+j)*x[j];y[i]=(float)s;}lk.lock();if(--active_==0)done_.notify_one();}}public:MVWorkers(){for(auto&i:workers_)i=std::thread(&MVWorkers::worker,this);}~MVWorkers(){std::lock_guard<std::mutex>lk(mu_);stop_=true;cv_.notify_all();for(auto&i:workers_)if(i.joinable())i.join();}void run(const TensorBinding&w,const float*x,float*y,size_t r,size_t c){if(r<64){for(size_t i=0;i<r;i++){double s=0;for(size_t j=0;j<c;j++)s+=(double)elem(w,i*c+j)*x[j];y[i]=(float)s;}return;}{std::lock_guard<std::mutex>lk(mu_);w_=&w;x_=x;y_=y;r_=r;c_=c;next_=0;active_=workers_.size();++generation_;}cv_.notify_all();std::unique_lock<std::mutex>lk(mu_);done_.wait(lk,[&]{return active_==0;});}};
 static MVWorkers&mv_workers(){static MVWorkers p;return p;}
-static void mv(const TensorBinding&w,const float*x,float*y,size_t r,size_t c){mv_workers().run_mv(w,x,y,r,c);}
+static void mv(const TensorBinding&w,const float*x,float*y,size_t r,size_t c){mv_workers().run(w,x,y,r,c);}
 
 static void rms(const TensorBinding&w,std::vector<float>&x,float eps){double s=0;for(float z:x)s+=(double)z*z;float k=1.f/std::sqrt((float)(s/x.size())+eps);for(size_t i=0;i<x.size();i++)x[i]*=k*elem(w,i);}
 static void rope(float*x,size_t d,size_t pos,float theta){for(size_t i=0;i+1<d;i+=2){float a=pos*std::pow(theta,-2.f*(i/2.f)/d),c=std::cos(a),s=std::sin(a),u=x[i],v=x[i+1];x[i]=u*c-v*s;x[i+1]=u*s+v*c;}}
@@ -95,14 +43,9 @@ static std::string u8cp(uint32_t cp){std::string s;if(cp<0x80)s.push_back((char)
 static std::vector<uint32_t> cps(const std::string&s){std::vector<uint32_t>o;for(size_t i=0;i<s.size();){uint8_t c=(uint8_t)s[i++];if(c<0x80)o.push_back(c);else if((c>>5)==6&&i<s.size())o.push_back(((c&31)<<6)|((uint8_t)s[i++]&63));else if((c>>4)==14&&i+1<s.size())o.push_back(((c&15)<<12)|(((uint8_t)s[i++]&63)<<6)|((uint8_t)s[i++]&63));else if((c>>3)==30&&i+2<s.size())o.push_back(((c&7)<<18)|(((uint8_t)s[i++]&63)<<12)|(((uint8_t)s[i++]&63)<<6)|((uint8_t)s[i++]&63));else o.push_back(0xFFFD);}return o;}
 static std::array<std::string,256> byte_enc(){std::array<std::string,256>a;std::vector<int>bs;for(int b=33;b<=126;b++)bs.push_back(b);for(int b=161;b<=172;b++)bs.push_back(b);for(int b=174;b<=255;b++)bs.push_back(b);std::array<bool,256>used{};for(int b:bs)used[b]=true;for(int b=0;b<256;b++)if(!used[b])bs.push_back(b);for(size_t i=0;i<bs.size();i++){int b=bs[i];uint32_t cp=(uint32_t)b;if(i>=189)cp=256+(uint32_t)(i-189);a[b]=u8cp(cp);}return a;}
 static std::string byte_decode(const std::string&s){static const auto enc=byte_enc();std::unordered_map<uint32_t,uint8_t>rev;for(int b=0;b<256;b++)for(uint32_t cp:cps(enc[b]))rev[cp]=(uint8_t)b;std::string r;for(uint32_t cp:cps(s)){auto it=rev.find(cp);if(it!=rev.end())r.push_back((char)it->second);else r+=u8cp(cp);}return r;}
-static bool is_ascii_letter(uint8_t c){return(c>='A'&&c<='Z')||(c>='a'&&c<='z');}
-static bool is_digit(uint8_t c){return c>='0'&&c<='9';}
-static bool is_space(uint8_t c){return c==' '||c=='\t'||c=='\n'||c=='\r'||c=='\f'||c=='\v';}
-static bool is_punct(uint8_t c){return !is_ascii_letter(c)&&!is_digit(c)&&!is_space(c);}
-static std::vector<std::string> smollm_split(const std::string&s){std::vector<std::string>out;size_t p=0,n=s.size();while(p<n){size_t st=p;if(s[p]=='\''&&p+1<n){size_t e=p+1;if((s[e]=='s'||s[e]=='S'||s[e]=='t'||s[e]=='T'||s[e]=='m'||s[e]=='M'||s[e]=='d'||s[e]=='D')&&e+1<=n){out.push_back(s.substr(p,2));p+=2;continue;}if((s[e]=='r'||s[e]=='R'||s[e]=='v'||s[e]=='V'||s[e]=='l'||s[e]=='L')&&e+2<n){if((s[e+1]=='e'||s[e+1]=='E'||s[e+1]=='l'||s[e+1]=='L')){out.push_back(s.substr(p,3));p+=3;continue;}}}if(is_space((uint8_t)s[p])){while(p<n&&is_space((uint8_t)s[p]))p++;out.push_back(s.substr(st,p-st));continue;}if(is_digit((uint8_t)s[p])){size_t k=0;while(p<n&&is_digit((uint8_t)s[p])&&k<1){p++;k++;}out.push_back(s.substr(st,p-st));continue;}if(is_ascii_letter((uint8_t)s[p])||s[p]>=0x80){while(p<n&&(is_ascii_letter((uint8_t)s[p])||s[p]>=0x80))p++;out.push_back(s.substr(st,p-st));continue;}if(is_punct((uint8_t)s[p])){while(p<n&&is_punct((uint8_t)s[p]))p++;out.push_back(s.substr(st,p-st));continue;}p++;out.push_back(s.substr(st,1));}return out;}
-static std::string encode_bytes(const std::string&s){static const auto enc=byte_enc();std::string r;for(unsigned char b:s)r+=enc[b];return r;}
-static std::vector<std::string> symbols(const std::string&s){std::vector<std::string>v;for(uint32_t cp:cps(s))v.push_back(u8cp(cp));return v;}
-static std::vector<std::string> bpe(const std::string&s,const TokState&st){auto v=symbols(encode_bytes(s));if(v.empty())return v;for(;;){int best=std::numeric_limits<int>::max();size_t at=v.size();for(size_t i=0;i+1<v.size();i++){auto it=st.rank.find(v[i]+" "+v[i+1]);if(it!=st.rank.end()&&it->second<best){best=it->second;at=i;}}if(at==v.size())break;v[at]+=v[at+1];v.erase(v.begin()+at+1);}return v;}
+static bool is_ascii_letter(uint8_t c){return(c>='A'&&c<='Z')||(c>='a'&&c<='z');}static bool is_digit(uint8_t c){return c>='0'&&c<='9';}static bool is_space(uint8_t c){return c==' '||c=='\t'||c=='\n'||c=='\r'||c=='\f'||c=='\v';}static bool is_punct(uint8_t c){return !is_ascii_letter(c)&&!is_digit(c)&&!is_space(c);}
+static std::vector<std::string> smollm_split(const std::string&s){std::vector<std::string>out;size_t p=0,n=s.size();while(p<n){size_t st=p;if(s[p]=='\''&&p+1<n){size_t e=p+1;if((s[e]=='s'||s[e]=='S'||s[e]=='t'||s[e]=='T'||s[e]=='m'||s[e]=='M'||s[e]=='d'||s[e]=='D')&&e+1<=n){out.push_back(s.substr(p,2));p+=2;continue;}if((s[e]=='r'||s[e]=='R'||s[e]=='v'||s[e]=='V'||s[e]=='l'||s[e]=='L')&&e+2<n&&(s[e+1]=='e'||s[e+1]=='E'||s[e+1]=='l'||s[e+1]=='L')){out.push_back(s.substr(p,3));p+=3;continue;}}if(is_space((uint8_t)s[p])){while(p<n&&is_space((uint8_t)s[p]))p++;out.push_back(s.substr(st,p-st));continue;}if(is_digit((uint8_t)s[p])){while(p<n&&is_digit((uint8_t)s[p]))p++;out.push_back(s.substr(st,p-st));continue;}if(is_ascii_letter((uint8_t)s[p])||s[p]>=0x80){while(p<n&&(is_ascii_letter((uint8_t)s[p])||s[p]>=0x80))p++;out.push_back(s.substr(st,p-st));continue;}if(is_punct((uint8_t)s[p])){while(p<n&&is_punct((uint8_t)s[p]))p++;out.push_back(s.substr(st,p-st));continue;}p++;out.push_back(s.substr(st,1));}return out;}
+static std::string encode_bytes(const std::string&s){static const auto enc=byte_enc();std::string r;for(unsigned char b:s)r+=enc[b];return r;}static std::vector<std::string> symbols(const std::string&s){std::vector<std::string>v;for(uint32_t cp:cps(s))v.push_back(u8cp(cp));return v;}static std::vector<std::string> bpe(const std::string&s,const TokState&st){auto v=symbols(encode_bytes(s));if(v.empty())return v;for(;;){int best=std::numeric_limits<int>::max();size_t at=v.size();for(size_t i=0;i+1<v.size();i++){auto it=st.rank.find(v[i]+" "+v[i+1]);if(it!=st.rank.end()&&it->second<best){best=it->second;at=i;}}if(at==v.size())break;v[at]+=v[at+1];v.erase(v.begin()+at+1);}return v;}
 bool Vocabulary::load(const gguf::Model&m){tokens_.clear();TokState st;auto*v=m.metadata("tokenizer.ggml.tokens");if(!v||!v->is_array())return false;auto*s=m.metadata("tokenizer.ggml.scores");auto*tt=m.metadata("tokenizer.ggml.token_type");tokens_.reserve(v->array.size());for(size_t i=0;i<v->array.size();i++){if(!v->array[i].is_string())return false;Token t{v->array[i].string,0};if(s&&s->is_array()&&i<s->array.size())sf(&s->array[i],t.score);tokens_.push_back(std::move(t));st.id[tokens_.back().text]=(int32_t)i;if(tt&&tt->is_array()&&i<tt->array.size()){uint32_t typ=0;if(tt->array[i].bytes.size()>=4)std::memcpy(&typ,tt->array[i].bytes.data(),4);if(typ==3||typ==4)st.special[tokens_.back().text]=true;}if(tokens_.back().text.size()>4&&tokens_.back().text.rfind("<|",0)==0&&tokens_.back().text.substr(tokens_.back().text.size()-2)=="|>")st.special[tokens_.back().text]=true;}auto*model=m.metadata("tokenizer.ggml.model");st.gpt2=model&&model->is_string()&&model->string=="gpt2";auto*merges=m.metadata("tokenizer.ggml.merges");if(merges&&merges->is_array())for(size_t i=0;i<merges->array.size();i++)if(merges->array[i].is_string()){const auto&q=merges->array[i].string;size_t sp=q.find(' ');if(sp!=std::string::npos&&sp+1<q.size())st.rank[q.substr(0,sp)+" "+q.substr(sp+1)]=(int)i;}states[this]=std::move(st);return!tokens_.empty();}
 bool Vocabulary::encode(const std::string&s,std::vector<int32_t>&out)const{out.clear();auto itst=states.find(this);if(itst==states.end())return false;const TokState&st=itst->second;size_t p=0;while(p<s.size()){size_t special_end=std::string::npos;int32_t special_id=-1;if(s[p]=='<'){size_t e=s.find("|>",p+2);if(e!=std::string::npos){e+=2;std::string x=s.substr(p,e-p);auto it=st.id.find(x);if(it!=st.id.end()&&st.special.find(x)!=st.special.end()){special_end=e;special_id=it->second;}}}if(special_end!=std::string::npos){out.push_back(special_id);p=special_end;continue;}size_t next=s.find("<|",p);std::string chunk=(next==std::string::npos?s.substr(p):s.substr(p,next-p));if(chunk.empty()){p=next;continue;}for(const auto&piece:smollm_split(chunk))if(!piece.empty())for(const auto&sym:bpe(piece,st)){auto it=st.id.find(sym);if(it==st.id.end())return false;out.push_back(it->second);}p=(next==std::string::npos?s.size():next);}return!out.empty();}
 std::string Vocabulary::decode(int32_t id)const{if(id<0||(size_t)id>=tokens_.size())return{};const std::string&s=tokens_[id].text;if(s.size()>=4&&s.front()=='<'&&s.back()=='>'){if(s.rfind("<|",0)==0&&s.substr(s.size()-2)=="|>")return{};if(s.size()==6&&s[1]=='0'&&s[2]=='x'){auto hex=[](char c)->int{if(c>='0'&&c<='9')return c-'0';if(c>='a'&&c<='f')return c-'a'+10;if(c>='A'&&c<='F')return c-'A'+10;return-1;};int a=hex(s[3]),b=hex(s[4]);if(a>=0&&b>=0)return std::string(1,(char)((a<<4)|b));}}return byte_decode(s);}
