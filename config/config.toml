@@ -1,0 +1,19 @@
+[server]
+host = "0.0.0.0"
+port = 8787
+workers = 1
+
+[engine]
+runtime = "llama-cli"
+models_dir = "/var/lib/pi-ai-lab/models"
+timeout_seconds = 300
+max_prompt_chars = 32768
+default_max_tokens = 128
+default_threads = 0
+
+[monitor]
+interval_seconds = 2
+
+[security]
+max_concurrent_jobs = 1
+allow_remote_api = true
