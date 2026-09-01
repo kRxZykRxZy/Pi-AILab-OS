@@ -5,9 +5,9 @@ namespace pilab::ai { void init(uint32_t,uint32_t); }
 namespace pilab {
 void kernel_main(uint32_t r0,uint32_t r1,uint32_t atags){
  (void)r0;(void)r1;(void)atags;
- uart::init(); console_init(); memory_init();
+ uart::init(); memory_init();
  uart::write("\r\n[Pi AI Lab OS] native kernel booting...\r\n");
- uart::write("[OK] ARM32 bootstrap\r\n");
+ uart::write("[OK] ARMv7 bootstrap\r\n");
  uart::write("[OK] MMU enabled\r\n");
  uart::write("[OK] kernel heap online\r\n");
  ai::init(4096,1);
