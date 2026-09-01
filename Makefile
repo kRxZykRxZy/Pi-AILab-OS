@@ -3,7 +3,7 @@ AARCH64_CROSS ?= aarch64-none-elf-
 BUILD := build
 CFLAGS := -ffreestanding -fno-builtin -fno-stack-protector -nostdlib -nostartfiles -nodefaultlibs -Wall -Wextra -O2 -Iinclude
 CXXFLAGS := $(CFLAGS) -fno-exceptions -fno-rtti -fno-use-cxa-atexit
-KERNEL_CPP := kernel/kernel.cpp kernel/console.cpp kernel/printf.cpp kernel/panic.cpp kernel/ai_engine.cpp
+KERNEL_CPP := kernel/kernel.cpp kernel/console.cpp kernel/printf.cpp kernel/panic.cpp kernel/ai_engine.cpp kernel/scheduler.cpp kernel/syscall.cpp kernel/vfs.cpp kernel/timer.cpp ai/tensor.cpp ai/gguf.cpp ai/tokenizer.cpp
 KERNEL_C := kernel/memory.c
 
 .PHONY: all armv6 armv7 armv8 clean
