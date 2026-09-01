@@ -1,0 +1,23 @@
+[Unit]
+Description=Pi AI Lab OS API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pilab
+Group=pilab
+WorkingDirectory=/opt/pi-ai-lab
+Environment=PILAB_ROOT=/var/lib/pi-ai-lab
+Environment=PILAB_RUNTIME=llama-cli
+Environment=PILAB_MAX_CONCURRENT_JOBS=1
+ExecStart=/opt/pi-ai-lab/venv/bin/uvicorn api.main:app --host 0.0.0.0 --port 8787
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/var/lib/pi-ai-lab
+
+[Install]
+WantedBy=multi-user.target
