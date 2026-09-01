@@ -6,8 +6,18 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+set(PAIGEN ${CMAKE_CURRENT_BINARY_DIR}/generated/inference_v4.cpp)
+add_custom_command(
+  OUTPUT ${PAIGEN}
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/fix_inference_source.py ${CMAKE_CURRENT_SOURCE_DIR}/src/inference_v4.cpp ${PAIGEN}
+  DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/inference_v4.cpp ${CMAKE_CURRENT_SOURCE_DIR}/tools/fix_inference_source.py
+  VERBATIM
+)
+add_custom_target(piai_inference_source DEPENDS ${PAIGEN})
 add_executable(piai src/main.cpp src/gguf_v3.cpp src/quant.cpp src/transformer.cpp src/api.cpp src/runtime.cpp src/platform.cpp src/inference_parallel.cpp src/architecture_v2.cpp)
-target_include_directories(piai PRIVATE include)
+add_dependencies(piai piai_inference_source)
+target_include_directories(piai PRIVATE include ${CMAKE_CURRENT_BINARY_DIR}/generated)
 target_compile_options(piai PRIVATE -Wall -Wextra -Wpedantic -O3 -ffunction-sections -fdata-sections -pthread)
 target_link_options(piai PRIVATE -Wl,--gc-sections -pthread)
 if(UNIX)
