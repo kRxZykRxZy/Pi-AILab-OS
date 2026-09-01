@@ -1,0 +1,17 @@
+[Unit]
+Description=Pi-AI Lab Runtime
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/piai
+Restart=always
+RestartSec=2
+User=root
+WorkingDirectory=/var/lib/piai
+NoNewPrivileges=true
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target
