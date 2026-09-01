@@ -10,7 +10,9 @@ arm32_mmu_enable:
     mov r5, #0
 1:
     mov r7, r5, lsl #20
-    orr r7, r7, #0xC02
+    mov r0, #0xC00
+    orr r7, r7, r0
+    orr r7, r7, #2
     str r7, [r4, r5, lsl #2]
     add r5, r5, #1
     cmp r5, #1024
