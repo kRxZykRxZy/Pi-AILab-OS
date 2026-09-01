@@ -1,0 +1,8 @@
+Package: piai
+Version: 0.1.0
+Section: utils
+Priority: optional
+Architecture: any
+Maintainer: Pi-AI Lab
+Description: Lightweight Pi-AI Lab native inference runtime
+ A low-overhead C++ runtime and local API service for AI inference.
