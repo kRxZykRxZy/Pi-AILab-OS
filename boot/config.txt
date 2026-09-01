@@ -1,3 +1,0 @@
-arm_64bit=0
-enable_uart=1
-kernel=kernel.img
