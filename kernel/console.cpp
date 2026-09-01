@@ -1,7 +1,14 @@
 #include "kernel.h"
 
 namespace pilab {
-static volatile uint32_t* const UART0 = (volatile uint32_t*)0x3F201000;
+#if defined(PILAB_ARMV6)
+static constexpr uintptr_t UART_BASE = 0x20201000u;
+#elif defined(PILAB_ARMV8)
+static constexpr uintptr_t UART_BASE = 0xFE201000u;
+#else
+static constexpr uintptr_t UART_BASE = 0x3F201000u;
+#endif
+static volatile uint32_t* const UART0 = (volatile uint32_t*)UART_BASE;
 static constexpr uint32_t UART_DR = 0;
 static constexpr uint32_t UART_FR = 6;
 
