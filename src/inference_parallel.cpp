@@ -1,6 +1,10 @@
 // Single inclusion point for the complete inference engine. Rename the
 // tokenizer entry points while including the implementation so we can replace
 // only the model-aware byte-level codec without duplicating the transformer.
+// Include the public declarations first: inference_v4.cpp includes this header
+// too, and its pragma-once guard must prevent the encode/decode declarations
+// from being renamed by the compatibility macros below.
+#include "inference.hpp"
 #define encode encode_legacy
 #define decode decode_legacy
 #include "inference_v4.cpp"
