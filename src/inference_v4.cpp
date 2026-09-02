@@ -36,9 +36,6 @@ static inline float dot_f16(const uint8_t*wp,const float*x,size_t n){
         const uint16_t* w=reinterpret_cast<const uint16_t*>(wp+i*2);
         uint16x4_t h16=vld1_u16(w);uint32x4_t h32=vmovl_u16(h16);
         bool special=((h16[0]&0x7c00u)==0)||((h16[1]&0x7c00u)==0)||((h16[2]&0x7c00u)==0)||((h16[3]&0x7c00u)==0)||((h16[0]&0x7c00u)==0x7c00u)||((h16[1]&0x7c00u)==0x7c00u)||((h16[2]&0x7c00u)==0x7c00u)||((h16[3]&0x7c00u)==0x7c00u);
-        if(special){for(size_t j=0;j<4;j++){uint16_t q;std::memcpy(&q,wp+(i+j)*2,2);acc=vsetq_lane_f32(vget_lane_f32(vget_low_f32(acc),0),acc,0);/* exact specials handled below */x[i+j]=x[i+j];}
-            float z=0.f;for(size_t j=0;j<4;j++){uint16_t q;std::memcpy(&q,wp+(i+j)*2,2);z+=elem(*(const TensorBinding*)nullptr,0)*0.f;z+=hf(q)*x[i+j];} /* unreachable type-safe helper is avoided below */
-        }
         uint32x4_t sign=vshlq_n_u32(vandq_u32(h32,vdupq_n_u32(0x8000u)),16);
         uint32x4_t exp=vaddq_u32(vshlq_n_u32(vandq_u32(h32,vdupq_n_u32(0x7c00u)),13),vdupq_n_u32(112u<<23));
         uint32x4_t mant=vshlq_n_u32(vandq_u32(h32,vdupq_n_u32(0x03ffu)),13);
