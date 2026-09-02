@@ -1,0 +1,45 @@
+name: Update AI worker pool
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  update-workers:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Make inference workers use all hardware threads
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('src/inference_v4.cpp')
+          s = p.read_text()
+          old = 'class MVWorkers{std::array<std::thread,3>workers_;'
+          new = 'class MVWorkers{std::vector<std::thread>workers_;'
+          if old not in s:
+              raise SystemExit('worker pool declaration not found')
+          s = s.replace(old, new, 1)
+          old_ctor = 'public:MVWorkers(){for(auto&i:workers_)i=std::thread(&MVWorkers::worker,this);}'
+          new_ctor = 'public:MVWorkers(){unsigned n=std::thread::hardware_concurrency();if(n==0)n=1;workers_.reserve(n);for(unsigned k=0;k<n;k++)workers_.emplace_back(&MVWorkers::worker,this);}'
+          if old_ctor not in s:
+              raise SystemExit('worker pool constructor not found')
+          s = s.replace(old_ctor, new_ctor, 1)
+          s = s.replace('// Three persistent workers are used for the large GEMV operations in the\n// transformer. Each worker claims independent output rows, giving the Pi 2B\n// a default 3/4-core inference workload without launching threads per token.', '// Persistent workers use every hardware thread reported by the CPU. Each worker\n// claims independent output rows without launching threads per token.')
+          p.write_text(s)
+          PY
+          git diff --check
+          git diff -- src/inference_v4.cpp
+
+      - name: Commit worker update
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/inference_v4.cpp
+          git diff --cached --quiet || git commit -m 'Use all CPU cores for AI inference workers'
+          git push
