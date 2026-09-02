@@ -5,14 +5,13 @@
 #include <arm_neon.h>
 #endif
 namespace piai::quant {
-static inline float h(uint16_t v){uint32_t s=(v>>15)&1,e=(v>>10)&31,f=v&1023;if(!e)return s?-(float)std::ldexp((float)f,-24):(float)std::ldexp((float)f,-24);if(e==31)return f?NAN:(s?-INFINITY:INFINITY);return std::ldexp(1.f+f/1024.f,(int)e-15)*(s?-1.f:1.f);}
-void f32_dot(const float*x,const float*w,size_t n,float&o){float a=0.f;size_t i=0;#if defined(__ARM_NEON) || defined(__ARM_NEON__)
-float32x4_t s=vdupq_n_f32(0.f);for(;i+4<=n;i+=4)s=vmlaq_f32(s,vld1q_f32(x+i),vld1q_f32(w+i));float32x2_t p=vadd_f32(vget_low_f32(s),vget_high_f32(s));p=vpadd_f32(p,p);a=vget_lane_f32(p,0);#endif
+static inline float h(uint16_t v){uint32_t s=(v>>15)&1,e=(v>>10)&31,f=v&1023;if(!e)return std::ldexp((float)f,-24)*(s?-1.f:1.f);if(e==31)return f?NAN:(s?-INFINITY:INFINITY);return std::ldexp(1.f+f/1024.f,(int)e-15)*(s?-1.f:1.f);}
+void f32_dot(const float*x,const float*w,size_t n,float&o){float a=0.f;size_t i=0;
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+float32x4_t s=vdupq_n_f32(0.f);for(;i+4<=n;i+=4)s=vmlaq_f32(s,vld1q_f32(x+i),vld1q_f32(w+i));float32x2_t p=vadd_f32(vget_low_f32(s),vget_high_f32(s));p=vpadd_f32(p,p);a=vget_lane_f32(p,0);
+#endif
 for(;i<n;i++)a+=x[i]*w[i];o=a;}
-void q8_0_dot(const float*x,const void*ww,size_t n,float&o){const uint8_t*p=(const uint8_t*)ww;float a=0.f;for(size_t b=0,i=0;i<n;i+=32,b+=34){uint16_t ds;std::memcpy(&ds,p+b,2);float d=h(ds);size_t j=0;#if defined(__ARM_NEON) || defined(__ARM_NEON__)
-float32x4_t s=vdupq_n_f32(0.f);for(;j+4<=32&&i+j<n;j+=4){int8_t qv[4]={(int8_t)p[b+2+j],(int8_t)p[b+3+j],(int8_t)p[b+4+j],(int8_t)p[b+5+j]};int32x4_t qi={qv[0],qv[1],qv[2],qv[3]};s=vmlaq_n_f32(s, vld1q_f32(x+i+j), d);s=vaddq_f32(s, vmulq_n_f32(vreinterpretq_f32_s32(qi),vdupq_n_f32(0.f)));}
-float32x2_t z=vadd_f32(vget_low_f32(s),vget_high_f32(s));z=vpadd_f32(z,z);a+=vget_lane_f32(z,0);#endif
-for(;j<32&&i+j<n;j++)a+=x[i+j]*(d*(int8_t)p[b+2+j]);}o=a;}
+void q8_0_dot(const float*x,const void*ww,size_t n,float&o){const uint8_t*p=(const uint8_t*)ww;float a=0.f;for(size_t b=0,i=0;i<n;i+=32,b+=34){uint16_t ds;std::memcpy(&ds,p+b,2);float d=h(ds);for(size_t j=0;j<32&&i+j<n;j++)a+=x[i+j]*(d*(int8_t)p[b+2+j]);}o=a;}
 void q4_0_dot(const float*x,const void*ww,size_t n,float&o){const uint8_t*p=(const uint8_t*)ww;float a=0.f;for(size_t b=0,i=0;i<n;i+=32,b+=18){uint16_t ds;std::memcpy(&ds,p+b,2);float d=h(ds);for(size_t j=0;j<32&&i+j<n;j++){uint8_t z=p[b+2+j/2];int q=(j&1)?(z>>4):(z&15);a+=x[i+j]*(d*(q-8));}}o=a;}
 void q5_0_dot(const float*x,const void*ww,size_t n,float&o){const uint8_t*p=(const uint8_t*)ww;float a=0.f;for(size_t b=0,i=0;i<n;i+=32,b+=22){uint16_t ds;std::memcpy(&ds,p+b,2);float d=h(ds);uint32_t qh;std::memcpy(&qh,p+b+2,4);for(size_t j=0;j<32&&i+j<n;j++){uint8_t z=p[b+6+j/2];int q=(j&1)?(z>>4):(z&15);q|=((qh>>j)&1)<<4;a+=x[i+j]*(d*(q-16));}}o=a;}
 void q4_1_dot(const float*x,const void*ww,size_t n,float&o){const uint8_t*p=(const uint8_t*)ww;float a=0.f;for(size_t b=0,i=0;i<n;i+=32,b+=20){uint16_t ds,ms;std::memcpy(&ds,p+b,2);std::memcpy(&ms,p+b+2,2);float d=h(ds),m=h(ms);for(size_t j=0;j<32&&i+j<n;j++){uint8_t z=p[b+4+j/2];int q=(j&1)?z>>4:z&15;a+=x[i+j]*(d*q+m);}}o=a;}
