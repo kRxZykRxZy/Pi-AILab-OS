@@ -18,6 +18,7 @@ jobs:
         run: |
           python3 <<'PY'
           from pathlib import Path
+          import re
 
           p=Path('CMakeLists.txt')
           s=p.read_text()
@@ -37,10 +38,13 @@ jobs:
           if '#include <arm_neon.h>' not in s:
               s=s.replace('#include <array>','#include <array>\n#if defined(__ARM_NEON) || defined(__ARM_NEON__)\n#include <arm_neon.h>\n#endif',1)
 
-          a=s.find('class MVWorkers{')
+          # The old generated version accidentally contained a block that wrote
+          # through the const input pointer. Remove that block robustly, then
+          # replace the worker/dot section with the known-good implementation.
+          a=s.find('static inline float dot_f16(')
           b=s.find('static MVWorkers&mv_workers()',a)
           if a<0 or b<0:
-              raise SystemExit('worker pool markers not found')
+              raise SystemExit('inference optimization markers not found')
 
           new=r'''static inline float dot_f16(const uint8_t*wp,const float*x,size_t n){
           #if defined(__ARM_NEON) || defined(__ARM_NEON__)
