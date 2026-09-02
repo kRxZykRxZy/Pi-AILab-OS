@@ -1,4 +1,4 @@
-name: Implement token streaming
+name: Pi-AI Lab CI
 
 on:
   push:
@@ -8,137 +8,21 @@ permissions:
   contents: write
 
 jobs:
-  implement:
+  build:
     if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Implement SSE token streaming
+      - name: Configure
+        run: cmake -S . -B build-ci -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build-ci --parallel 2
+      - name: Verify tokenizer and NEON source
         run: |
-          python3 <<'PY'
-          from pathlib import Path
-          import re
-
-          # ---- inference API ----
-          p = Path('include/inference.hpp')
-          s = p.read_text()
-          if '#include <functional>' not in s:
-              s = s.replace('#include <cstdint>', '#include <cstdint>\n#include <functional>')
-          old = 'bool generate(const std::string&,size_t,std::vector<std::string>&);'
-          new = 'bool generate(const std::string&,size_t,std::vector<std::string>&,const std::function<bool(const std::string&)>& on_token={});'
-          if old in s:
-              s = s.replace(old, new)
-          p.write_text(s)
-
-          # Find one C++ function body while respecting strings/chars.
-          def body_bounds(src, start):
-              op = src.find('{', start)
-              if op < 0: raise RuntimeError('generate body not found')
-              depth = 0; quote = None; esc = False
-              for i in range(op, len(src)):
-                  c = src[i]
-                  if quote:
-                      if esc: esc = False
-                      elif c == '\\': esc = True
-                      elif c == quote: quote = None
-                      continue
-                  if c in "\"'": quote = c; continue
-                  if c == '{': depth += 1
-                  elif c == '}':
-                      depth -= 1
-                      if depth == 0: return op, i
-              raise RuntimeError('unterminated generate body')
-
-          # ---- inference implementation ----
-          for fn in ['src/inference_v4.cpp', 'src/inference.cpp', 'src/inference_parallel.cpp']:
-              p = Path(fn)
-              if not p.exists():
-                  continue
-              s = p.read_text()
-              pos = s.find('bool Engine::generate(')
-              if pos < 0:
-                  continue
-              sig_end = s.find('{', pos)
-              sig = s[pos:sig_end]
-              if 'on_token' not in sig:
-                  sig = re.sub(r'bool Engine::generate\(([^)]*)\)',
-                               r'bool Engine::generate(\1,const std::function<bool(const std::string&)>& on_token)', sig)
-                  s = s[:pos] + sig + s[sig_end:]
-              op, cl = body_bounds(s, pos)
-              body = s[op+1:cl]
-              # Emit immediately after each generated output token is appended.
-              body = re.sub(r'out\.push_back\((.*?)\);',
-                            r'out.push_back(\1);if(on_token&&!on_token(out.back()))return false;', body)
-              s = s[:op+1] + body + s[cl:]
-              p.write_text(s)
-              break
-
-          # ---- API declaration ----
-          p = Path('include/api.hpp')
-          s = p.read_text()
-          marker = 'Response load_model(const std::string&); Response generate(const Request&,const std::string&);'
-          replacement = 'Response load_model(const std::string&); Response generate(const Request&,const std::string&); void stream_generate(int,const Request&,const std::string&);'
-          if marker in s:
-              s = s.replace(marker, replacement)
-          p.write_text(s)
-
-          # ---- API implementation ----
-          p = Path('src/api.cpp')
-          s = p.read_text()
-          if 'void Server::stream_generate(' not in s:
-              marker = 'Response Server::route(const Request&r){'
-              method = r'''void Server::stream_generate(int c,const Request&r,const std::string&name){
-          auto send_all=[&](const std::string&s){size_t off=0;while(off<s.size()){ssize_t n=send(c,s.data()+off,s.size()-off,MSG_NOSIGNAL);if(n<=0)return false;off+=(size_t)n;}return true;};
-          auto fail=[&](int code,const std::string&msg){std::string b="{\"error\":\""+json_escape(msg)+"\"}";std::string h="HTTP/1.1 "+std::to_string(code)+" "+reason(code)+"\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"+b;send_all(h);};
-          if(!engine_||!model_||loaded_name_!=name){fail(409,"model_not_loaded");return;}
-          std::string prompt;size_t max_tokens=256;std::smatch m;
-          if(std::regex_search(r.body,m,std::regex("\\\"prompt\\\"\\s*:\\s*\\\"([^\\\"]*)\\\"")))prompt=m[1].str();else{fail(400,"prompt_required");return;}
-          if(std::regex_search(r.body,m,std::regex("\\\"max_tokens\\\"\\s*:\\s*(\\d+)"))){try{max_tokens=std::stoull(m[1].str());}catch(...){fail(400,"invalid_max_tokens");return;}}
-          if(max_tokens==0||max_tokens>4096){fail(400,"max_tokens_out_of_range");return;}
-          std::string h="HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n";
-          if(!send_all(h))return;
-          auto callback=[&](const std::string&t){std::string d="event: token\ndata: {\"token\":\""+json_escape(t)+"\"}\n\n";return send_all(d);};
-          std::vector<std::string>tokens;
-          bool ok=engine_->generate(prompt,max_tokens,tokens,callback);
-          std::string done=ok?"event: done\ndata: {\"tokens\":"+std::to_string(tokens.size())+"}\n\n":"event: error\ndata: {\"error\":\"inference_failed\"}\n\n";
-          send_all(done);
-          }
-          '''
-              if marker not in s:
-                  raise RuntimeError('API route marker not found')
-              s = s.replace(marker, method + marker, 1)
-
-          # Intercept /generate/stream before normal buffered routing.
-          old = 'r.body=raw.substr(he+4);Response out=route(r);'
-          new = '''r.body=raw.substr(he+4);std::string rp=url_path(r.path);const std::string pre="/api/v1/models/";if(r.method=="POST"&&rp.rfind(pre,0)==0){std::string rest=rp.substr(pre.size());auto slash=rest.find('/');if(slash!=std::string::npos&&rest.substr(slash+1)=="stream"){stream_generate(c,r,rest.substr(0,slash));::close(c);return;}}Response out=route(r);'''
-          if old not in s:
-              raise RuntimeError('serve_once insertion point not found')
-          s = s.replace(old, new, 1)
-          p.write_text(s)
-
-          # ---- web client ----
-          p = Path('web/app.js')
-          s = p.read_text()
-          start = s.find('async function send(){')
-          end = s.find('\n$(' , start)
-          if start < 0 or end < 0:
-              raise RuntimeError('send() function not found')
-          send_fn = r'''async function send(){const input=$('prompt'),text=input.value.trim();if(!text)return;if(!activeModel){$('modelsPanel').classList.remove('hidden');return}input.value='';input.style.height='auto';$('send').disabled=true;addMessage(text,'user');const bubble=addMessage('','assistant');bubble.classList.add('typing');try{const r=await fetch('/api/v1/models/'+encodeURIComponent(activeModel)+'/stream',{method:'POST',headers:{'Content-Type':'application/json','Accept':'text/event-stream'},body:JSON.stringify({prompt:text,max_tokens:256})});if(!r.ok){const d=await r.json().catch(()=>({}));throw new Error(d.error||`HTTP ${r.status}`)}const reader=r.body.getReader(),decoder=new TextDecoder();let pending='',done=false,got=false;while(!done){const x=await reader.read();done=x.done;if(x.value)pending+=decoder.decode(x.value,{stream:!done});let parts=pending.split('\n\n');pending=parts.pop()||'';for(const part of parts){const dm=part.split('\n').find(v=>v.startsWith('data: '));if(!dm)continue;const d=JSON.parse(dm.slice(6));if(part.includes('event: token')){bubble.classList.remove('typing');bubble.textContent+=d.token;got=true;$('chat').scrollTop=$('chat').scrollHeight}else if(part.includes('event: error'))throw new Error(d.error||'inference_failed')}}if(!got)bubble.textContent='(empty response)';bubble.classList.remove('typing')}catch(e){bubble.classList.remove('typing');bubble.textContent='Error: '+e.message}$('send').disabled=false;$('chat').scrollTop=$('chat').scrollHeight}'''
-          s = s[:start] + send_fn + s[end:]
-          p.write_text(s)
-          PY
-
-      - name: Verify and commit
+          grep -q 'correct_byte_encoder' src/inference_parallel.cpp
+          grep -q 'encode_sentencepiece' src/inference_parallel.cpp
+          ! grep -q 'x\[i+j\]=x\[i+j\]' src/inference_v4.cpp
+      - name: Commit generated source changes if any
         run: |
           git diff --check
-          git diff --stat
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add include/inference.hpp src/inference_v4.cpp src/inference.cpp src/inference_parallel.cpp include/api.hpp src/api.cpp web/app.js
-          if git diff --cached --quiet; then
-            echo 'No changes needed.'
-          else
-            git commit -m 'Add real-time token streaming to API and UI'
-            git push
-          fi
+          git status --short
