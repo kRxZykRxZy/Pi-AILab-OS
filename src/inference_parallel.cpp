@@ -70,6 +70,33 @@ static std::string decode_token_correct(const std::string& token, bool gpt2) {
     return out;
 }
 
+// Correct GPT-2 byte-level BPE helper. This was accidentally dropped during
+// the SentencePiece/Viterbi tokenizer change, leaving the GPT-2 encode path
+// with an undefined bpe_correct() call.
+static std::vector<std::string> bpe_correct(const std::string& s,const TokState& st) {
+    static const auto enc=correct_byte_encoder();
+    std::string encoded;
+    encoded.reserve(s.size()*2);
+    for (unsigned char b:s) encoded+=enc[b];
+    auto v=symbols(encoded);
+    if (v.empty()) return v;
+    for (;;) {
+        int best=std::numeric_limits<int>::max();
+        size_t at=v.size();
+        for (size_t i=0;i+1<v.size();++i) {
+            auto it=st.rank.find(v[i]+" "+v[i+1]);
+            if (it!=st.rank.end() && it->second<best) {
+                best=it->second;
+                at=i;
+            }
+        }
+        if (at==v.size()) break;
+        v[at]+=v[at+1];
+        v.erase(v.begin()+at+1);
+    }
+    return v;
+}
+
 // SentencePiece/unigram tokenization. GGUF stores the native pieces and their
 // scores. Use a small Viterbi dynamic program rather than unordered_map-order
 // greedy matching: greedy longest-match is not equivalent to SentencePiece and
@@ -102,9 +129,6 @@ static bool encode_sentencepiece(const std::string& input,const TokState& st,
     std::vector<int32_t> pick(n+1,-1);
     dp[0]=0.f;
 
-    // The prompt is short, so scanning the vocabulary is acceptable here and
-    // keeps the runtime independent of any tokenizer-specific external lib.
-    // Generation itself never enters this path; it only tokenizes the prompt.
     for (size_t p=0;p<n;++p) {
         if (!std::isfinite(dp[p])) continue;
         for (const auto& kv:st.id) {
