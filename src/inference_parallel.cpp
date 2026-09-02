@@ -70,33 +70,10 @@ static std::string decode_token_correct(const std::string& token, bool gpt2) {
     return out;
 }
 
-static std::vector<std::string> bpe_correct(const std::string& s,const TokState& st) {
-    static const auto enc=correct_byte_encoder();
-    std::string encoded;
-    encoded.reserve(s.size()*2);
-    for (unsigned char b:s) encoded+=enc[b];
-    auto v=symbols(encoded);
-    if (v.empty()) return v;
-    for (;;) {
-        int best=std::numeric_limits<int>::max();
-        size_t at=v.size();
-        for (size_t i=0;i+1<v.size();++i) {
-            auto it=st.rank.find(v[i]+" "+v[i+1]);
-            if (it!=st.rank.end() && it->second<best) {
-                best=it->second;
-                at=i;
-            }
-        }
-        if (at==v.size()) break;
-        v[at]+=v[at+1];
-        v.erase(v.begin()+at+1);
-    }
-    return v;
-}
-
-// SentencePiece-style fallback for llama/mistral/phi-family tokenizers.
-// The GGUF vocabulary already contains the model's native pieces, so match
-// against those pieces rather than incorrectly applying GPT-2 byte BPE.
+// SentencePiece/unigram tokenization. GGUF stores the native pieces and their
+// scores. Use a small Viterbi dynamic program rather than unordered_map-order
+// greedy matching: greedy longest-match is not equivalent to SentencePiece and
+// can select completely wrong token IDs, producing plausible-looking garbage.
 static bool encode_sentencepiece(const std::string& input,const TokState& st,
                                  const std::vector<Token>& tokens,
                                  std::vector<int32_t>& out) {
@@ -118,25 +95,44 @@ static bool encode_sentencepiece(const std::string& input,const TokState& st,
     }
     if (s.empty()) return true;
 
-    size_t p=0;
-    while (p<s.size()) {
-        size_t best=0;
-        int32_t best_id=-1;
-        // Longest native vocabulary piece wins. This is deterministic and
-        // avoids the byte-level corruption of the previous fallback.
+    const size_t n=s.size();
+    const float NEG=-std::numeric_limits<float>::infinity();
+    std::vector<float> dp(n+1,NEG);
+    std::vector<size_t> prev(n+1,0);
+    std::vector<int32_t> pick(n+1,-1);
+    dp[0]=0.f;
+
+    // The prompt is short, so scanning the vocabulary is acceptable here and
+    // keeps the runtime independent of any tokenizer-specific external lib.
+    // Generation itself never enters this path; it only tokenizes the prompt.
+    for (size_t p=0;p<n;++p) {
+        if (!std::isfinite(dp[p])) continue;
         for (const auto& kv:st.id) {
             const std::string& piece=kv.first;
-            if (piece.empty()) continue;
-            if (piece.size()<=best || piece.size()>s.size()-p) continue;
-            if (s.compare(p,piece.size(),piece)==0) {
-                best=piece.size();
-                best_id=kv.second;
+            if (piece.empty() || piece.size()>n-p) continue;
+            if (s.compare(p,piece.size(),piece)!=0) continue;
+            const int32_t id=kv.second;
+            if (id<0 || static_cast<size_t>(id)>=tokens.size()) continue;
+            const float score=tokens[static_cast<size_t>(id)].score;
+            const float cand=dp[p]+score;
+            const size_t q=p+piece.size();
+            if (cand>dp[q]) {
+                dp[q]=cand;
+                prev[q]=p;
+                pick[q]=id;
             }
         }
-        if (best_id<0) return false;
-        out.push_back(best_id);
-        p+=best;
     }
+    if (pick[n]<0) return false;
+
+    std::vector<int32_t> rev;
+    for (size_t p=n;p>0;) {
+        const int32_t id=pick[p];
+        if (id<0) return false;
+        rev.push_back(id);
+        p=prev[p];
+    }
+    out.insert(out.end(),rev.rbegin(),rev.rend());
     return !out.empty();
 }
 
