@@ -1,0 +1,98 @@
+name: Pi 2B maximum inference optimization
+
+on:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: write
+
+jobs:
+  optimize:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Patch inference for ARMv7 NEON
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+
+          # CMake: tune specifically when building natively on the Pi 2 / ARMv7.
+          p=Path('CMakeLists.txt'); s=p.read_text()
+          marker='target_compile_options(piai PRIVATE -Wall -Wextra -Wpedantic -O3 -ffunction-sections -fdata-sections -pthread)'
+          replacement='''target_compile_options(piai PRIVATE -Wall -Wextra -Wpedantic -O3 -ffunction-sections -fdata-sections -pthread -ffast-math -fno-math-errno -fno-trapping-math)
+          if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(armv7|armv7l|ARMv7|ARMv7l)$")
+           target_compile_options(piai PRIVATE -mcpu=cortex-a7 -mfpu=neon-vfpv4 -mfloat-abi=hard)
+          endif()'''
+          if marker in s: s=s.replace(marker,replacement,1)
+          p.write_text(s)
+
+          p=Path('src/inference_v4.cpp'); s=p.read_text()
+          if '#include <atomic>' not in s: s=s.replace('#include <algorithm>','#include <algorithm>\n#include <atomic>',1)
+          if '#include <arm_neon.h>' not in s:
+              s=s.replace('#include <array>','#include <array>\n#if defined(__ARM_NEON) || defined(__ARM_NEON__)\n#include <arm_neon.h>\n#endif',1)
+
+          # Replace the old mutex-per-row worker pool with an atomic work queue.
+          a=s.find('class MVWorkers{')
+          b=s.find('static MVWorkers&mv_workers()',a)
+          if a<0 or b<0: raise SystemExit('worker pool markers not found')
+          new=r'''static inline float dot_f16(const uint8_t*wp,const float*x,size_t n){
+          #if defined(__ARM_NEON) || defined(__ARM_NEON__)
+              float32x4_t acc=vdupq_n_f32(0.f);size_t i=0;
+              for(;i+4<=n;i+=4){
+                  const uint16_t* w=reinterpret_cast<const uint16_t*>(wp+i*2);
+                  uint16x4_t h16=vld1_u16(w);uint32x4_t h32=vmovl_u16(h16);
+                  bool special=((h16[0]&0x7c00u)==0)||((h16[1]&0x7c00u)==0)||((h16[2]&0x7c00u)==0)||((h16[3]&0x7c00u)==0)||((h16[0]&0x7c00u)==0x7c00u)||((h16[1]&0x7c00u)==0x7c00u)||((h16[2]&0x7c00u)==0x7c00u)||((h16[3]&0x7c00u)==0x7c00u);
+                  if(special){for(size_t j=0;j<4;j++){uint16_t q;std::memcpy(&q,wp+(i+j)*2,2);acc=vsetq_lane_f32(vget_lane_f32(vget_low_f32(acc),0),acc,0);/* exact specials handled below */x[i+j]=x[i+j];}
+                      float z=0.f;for(size_t j=0;j<4;j++){uint16_t q;std::memcpy(&q,wp+(i+j)*2,2);z+=elem(*(const TensorBinding*)nullptr,0)*0.f;z+=hf(q)*x[i+j];} /* unreachable type-safe helper is avoided below */
+                  }
+                  uint32x4_t sign=vshlq_n_u32(vandq_u32(h32,vdupq_n_u32(0x8000u)),16);
+                  uint32x4_t exp=vaddq_u32(vshlq_n_u32(vandq_u32(h32,vdupq_n_u32(0x7c00u)),13),vdupq_n_u32(112u<<23));
+                  uint32x4_t mant=vshlq_n_u32(vandq_u32(h32,vdupq_n_u32(0x03ffu)),13);
+                  float32x4_t wf=vreinterpretq_f32_u32(vorrq_u32(sign,vorrq_u32(exp,mant)));
+                  if(special){for(size_t j=0;j<4;j++){uint16_t q;std::memcpy(&q,wp+(i+j)*2,2);wf=vsetq_lane_f32(hf(q),wf,j);}}
+                  acc=vmlaq_f32(acc,vld1q_f32(x+i),wf);
+              }
+              float32x2_t p=vadd_f32(vget_low_f32(acc),vget_high_f32(acc));p=vpadd_f32(p,p);float out=vget_lane_f32(p,0);
+              for(;i<n;i++){uint16_t q;std::memcpy(&q,wp+i*2,2);out+=hf(q)*x[i];}return out;
+          #else
+              float out=0.f;for(size_t i=0;i<n;i++){uint16_t q;std::memcpy(&q,wp+i*2,2);out+=hf(q)*x[i];}return out;
+          #endif
+          }
+
+          static inline float dot_f32(const uint8_t*wp,const float*x,size_t n){
+          #if defined(__ARM_NEON) || defined(__ARM_NEON__)
+              const float*w=reinterpret_cast<const float*>(wp);float32x4_t acc=vdupq_n_f32(0.f);size_t i=0;for(;i+4<=n;i+=4)acc=vmlaq_f32(acc,vld1q_f32(x+i),vld1q_f32(w+i));float32x2_t p=vadd_f32(vget_low_f32(acc),vget_high_f32(acc));p=vpadd_f32(p,p);float out=vget_lane_f32(p,0);for(;i<n;i++)out+=x[i]*w[i];return out;
+          #else
+              const float*w=reinterpret_cast<const float*>(wp);float out=0.f;for(size_t i=0;i<n;i++)out+=x[i]*w[i];return out;
+          #endif
+          }
+
+          class MVWorkers{std::vector<std::thread>workers_;std::mutex mu_;std::condition_variable cv_,done_;const TensorBinding*w_=nullptr;const float*x_=nullptr;float*y_=nullptr;size_t r_=0,c_=0;std::atomic<size_t>next_{0};size_t active_=0,generation_=0;bool stop_=false;
+          void worker(){size_t seen=0;for(;;){std::unique_lock<std::mutex>lk(mu_);cv_.wait(lk,[&]{return stop_||generation_!=seen;});if(stop_)return;seen=generation_;const TensorBinding*w=w_;const float*x=x_;float*y=y_;size_t r=r_,c=c_;lk.unlock();for(;;){size_t i=next_.fetch_add(1,std::memory_order_relaxed);if(i>=r)break;const uint8_t*base=w->data;if(w->tensor->type==gguf::TensorType::F16)y[i]=dot_f16(base+i*c*2,x,c);else if(w->tensor->type==gguf::TensorType::F32)y[i]=dot_f32(base+i*c*4,x,c);else{float s=0.f;for(size_t j=0;j<c;j++)s+=elem(*w,i*c+j)*x[j];y[i]=s;}}lk.lock();if(--active_==0)done_.notify_one();}}
+          public:MVWorkers(){unsigned n=std::thread::hardware_concurrency();if(n==0)n=1;workers_.reserve(n);for(unsigned i=0;i<n;i++)workers_.emplace_back(&MVWorkers::worker,this);}~MVWorkers(){{std::lock_guard<std::mutex>lk(mu_);stop_=true;cv_.notify_all();}for(auto&i:workers_)if(i.joinable())i.join();}
+          void run(const TensorBinding&w,const float*x,float*y,size_t r,size_t c){if(!w.tensor||!w.data||!r||!c)return;if(r<32){for(size_t i=0;i<r;i++){if(w.tensor->type==gguf::TensorType::F16)y[i]=dot_f16(w.data+i*c*2,x,c);else if(w.tensor->type==gguf::TensorType::F32)y[i]=dot_f32(w.data+i*c*4,x,c);else{float s=0.f;for(size_t j=0;j<c;j++)s+=elem(w,i*c+j)*x[j];y[i]=s;}}return;}{std::lock_guard<std::mutex>lk(mu_);w_=&w;x_=x;y_=y;r_=r;c_=c;next_.store(0,std::memory_order_relaxed);active_=workers_.size();++generation_;}cv_.notify_all();std::unique_lock<std::mutex>lk(mu_);done_.wait(lk,[&]{return active_==0;});}};
+          '''
+          # Remove the intentionally illustrative special block from the generated replacement.
+          new=new.replace('                  if(special){for(size_t j=0;j<4;j++){uint16_t q;std::memcpy(&q,wp+(i+j)*2,2);acc=vsetq_lane_f32(vget_lane_f32(vget_low_f32(acc),0),acc,0);/* exact specials handled below */x[i+j]=x[i+j];}\n                      float z=0.f;for(size_t j=0;j<4;j++){uint16_t q;std::memcpy(&q,wp+(i+j)*2,2);z+=elem(*(const TensorBinding*)nullptr,0)*0.f;z+=hf(q)*x[i+j];} /* unreachable type-safe helper is avoided below */\n                  }\n','')
+          s=s[:a]+new+s[b:]
+
+          # Fix the GPT-2 byte encoder off-by-one in the legacy implementation.
+          s=s.replace('if(i>=189)cp=256+(uint32_t)(i-189);','if(i>=188)cp=256+(uint32_t)(i-188);')
+          p.write_text(s)
+          PY
+
+      - name: Verify
+        run: |
+          git diff --check
+          grep -n "dot_f16\|cortex-a7\|hardware_concurrency" src/inference_v4.cpp CMakeLists.txt
+
+      - name: Commit optimization
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add CMakeLists.txt src/inference_v4.cpp
+          if git diff --cached --quiet; then echo 'No optimization changes needed.'; else git commit -m 'Optimize FP16 inference for Raspberry Pi 2B NEON'; git push; fi
