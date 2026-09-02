@@ -7,7 +7,7 @@
 #include <string>
 #include <vector>
 namespace piai::inference {
-struct Architecture { std::string name; size_t layers=0,hidden=0,heads=0,kv_heads=0,intermediate=0,vocab=0,context=0; float eps=1e-5f,rope_theta=10000.f; };
+struct Architecture { std::string name; size_t layers=0,hidden=0,heads=0,kv_heads=0,intermediate=0,vocab=0,context=0,rope_dim=0; float eps=1e-5f,rope_theta=10000.f; };
 bool detect_architecture(const gguf::Model&,Architecture&);
 struct Token {std::string text;float score=0;};
 class Vocabulary {std::vector<Token>tokens_;public:bool load(const gguf::Model&);bool encode(const std::string&,std::vector<int32_t>&)const;std::string decode(int32_t)const;bool encode_legacy(const std::string&,std::vector<int32_t>&)const;std::string decode_legacy(int32_t)const;size_t size()const{return tokens_.size();}};
