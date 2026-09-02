@@ -65,9 +65,36 @@ void run(const TensorBinding&w,const float*x,float*y,size_t r,size_t c){if(!w.te
 static MVWorkers&mv_workers(){static MVWorkers p;return p;}
 static void mv(const TensorBinding&w,const float*x,float*y,size_t r,size_t c){mv_workers().run(w,x,y,r,c);}
 
-static void rms(const TensorBinding&w,std::vector<float>&x,float eps){double s=0;for(float z:x)s+=(double)z*z;float k=1.f/std::sqrt((float)(s/x.size())+eps);for(size_t i=0;i<x.size();i++)x[i]*=k*elem(w,i);}
+static void rms(const TensorBinding&w,std::vector<float>&x,float eps){
+float s=0.f;size_t i=0;
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+float32x4_t a=vdupq_n_f32(0.f);for(;i+4<=x.size();i+=4){float32x4_t q=vld1q_f32(x.data()+i);a=vmlaq_f32(a,q,q);}float32x2_t p=vadd_f32(vget_low_f32(a),vget_high_f32(a));p=vpadd_f32(p,p);s=vget_lane_f32(p,0);
+#endif
+for(;i<x.size();i++)s+=x[i]*x[i];
+float k=1.f/std::sqrt(s/(float)x.size()+eps);for(i=0;i<x.size();i++)x[i]*=k*elem(w,i);}
+
 static void rope(float*x,size_t d,size_t pos,float theta){for(size_t i=0;i+1<d;i+=2){float a=pos*std::pow(theta,-2.f*(i/2.f)/d),c=std::cos(a),s=std::sin(a),u=x[i],v=x[i+1];x[i]=u*c-v*s;x[i+1]=u*s+v*c;}}
-static int sample(const std::vector<float>&l,const std::vector<int32_t>&hist,Sampling s,std::mt19937_64&r){if(l.empty())return-1;std::vector<std::pair<float,int>>v;v.reserve(l.size());for(size_t i=0;i<l.size();i++){float z=l[i];if(s.repeat_penalty>1)for(auto h:hist)if(h==(int32_t)i){z=z<0?z*s.repeat_penalty:z/s.repeat_penalty;break;}v.push_back({z,(int)i});}if(s.temperature<=0)return std::max_element(v.begin(),v.end())->second;for(auto&a:v)a.first/=s.temperature;std::sort(v.begin(),v.end(),[](auto&a,auto&b){return a.first>b.first;});if(s.top_k>0&&v.size()>(size_t)s.top_k)v.resize(s.top_k);float mx=v[0].first,sum=0;for(auto&a:v){a.first=std::exp(a.first-mx);sum+=a.first;}for(auto&a:v)a.first/=sum;float acc=0;size_t n=v.size();for(size_t i=0;i<v.size();i++){acc+=v[i].first;if(acc>=s.top_p){n=i+1;break;}}std::uniform_real_distribution<float>u(0,1);float total=0;for(size_t i=0;i<n;i++)total+=v[i].first;float q=u(r)*total,c=0;for(size_t i=0;i<n;i++){c+=v[i].first;if(q<=c)return v[i].second;}return v[n-1].second;}
+static int sample(const std::vector<float>&l,const std::vector<int32_t>&hist,Sampling s,std::mt19937_64&r){
+if(l.empty())return-1;
+const size_t K=(s.top_k>0)?std::min<size_t>((size_t)s.top_k,l.size()):l.size();
+std::vector<std::pair<float,int>>v;
+v.reserve(K+1);
+for(size_t i=0;i<l.size();i++){
+    float z=l[i];
+    if(s.repeat_penalty>1)for(auto h:hist)if(h==(int32_t)i){z=z<0?z*s.repeat_penalty:z/s.repeat_penalty;break;}
+    v.push_back({z,(int)i});
+}
+if(s.temperature<=0)return std::max_element(v.begin(),v.end())->second;
+for(auto&a:v)a.first/=s.temperature;
+if(K<v.size()){
+    std::nth_element(v.begin(),v.begin()+K,v.end(),[](const auto&a,const auto&b){return a.first>b.first;});
+    v.resize(K);
+}
+std::sort(v.begin(),v.end(),[](const auto&a,const auto&b){return a.first>b.first;});
+float mx=v[0].first,sum=0;for(auto&a:v){a.first=std::exp(a.first-mx);sum+=a.first;}
+for(auto&a:v)a.first/=sum;
+float acc=0;size_t n=v.size();for(size_t i=0;i<v.size();i++){acc+=v[i].first;if(acc>=s.top_p){n=i+1;break;}}
+std::uniform_real_distribution<float>u(0,1);float total=0;for(size_t i=0;i<n;i++)total+=v[i].first;float q=u(r)*total,c=0;for(size_t i=0;i<n;i++){c+=v[i].first;if(q<=c)return v[i].second;}return v[n-1].second;}
 
 bool KVCache::init(size_t l,size_t h,size_t d,size_t cap){if(!l||!h||!d||!cap||l>SIZE_MAX/(h*d)||l*h*d>SIZE_MAX/cap)return false;size_t n=l*h*d*cap;if(n>SIZE_MAX/(2*sizeof(float)))return false;k_.assign(n,0);v_.assign(n,0);layers_=l;heads_=h;head_dim_=d;capacity_=cap;used_=0;return true;}
 void KVCache::clear(){used_=0;std::fill(k_.begin(),k_.end(),0);std::fill(v_.begin(),v_.end(),0);}float*KVCache::key(size_t l,size_t p,size_t h){return k_.data()+((l*capacity_+p)*heads_+h)*head_dim_;}float*KVCache::value(size_t l,size_t p,size_t h){return v_.data()+((l*capacity_+p)*heads_+h)*head_dim_;}
