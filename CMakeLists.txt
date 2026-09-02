@@ -8,22 +8,19 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 set(PAIGEN ${CMAKE_CURRENT_BINARY_DIR}/generated/inference_v4.cpp)
-add_custom_command(
-  OUTPUT ${PAIGEN}
+add_custom_command(OUTPUT ${PAIGEN}
   COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/fix_inference_source.py ${CMAKE_CURRENT_SOURCE_DIR}/src/inference_v4.cpp ${PAIGEN}
-  DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/inference_v4.cpp ${CMAKE_CURRENT_SOURCE_DIR}/tools/fix_inference_source.py
-  VERBATIM
-)
+  DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/inference_v4.cpp ${CMAKE_CURRENT_SOURCE_DIR}/tools/fix_inference_source.py VERBATIM)
 add_custom_target(piai_inference_source DEPENDS ${PAIGEN})
 add_executable(piai src/main.cpp src/gguf_v3.cpp src/quant.cpp src/transformer.cpp src/api.cpp src/runtime.cpp src/platform.cpp src/inference_parallel.cpp src/architecture_v2.cpp)
 add_dependencies(piai piai_inference_source)
 target_include_directories(piai PRIVATE include ${CMAKE_CURRENT_BINARY_DIR}/generated)
-target_compile_options(piai PRIVATE -Wall -Wextra -Wpedantic -O3 -ffunction-sections -fdata-sections -pthread -ffast-math -fno-math-errno -fno-trapping-math)
+target_compile_options(piai PRIVATE -Wall -Wextra -Wpedantic -O3 -ffast-math -funsafe-math-optimizations -fno-math-errno -fno-trapping-math -ftree-vectorize -ftree-slp-vectorize -fomit-frame-pointer -ffunction-sections -fdata-sections -pthread)
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(armv7|armv7l|ARMv7|ARMv7l)$")
- target_compile_options(piai PRIVATE -mcpu=cortex-a7 -mfpu=neon-vfpv4 -mfloat-abi=hard)
+  target_compile_options(piai PRIVATE -mcpu=cortex-a7 -mtune=cortex-a7 -mfpu=neon-vfpv4 -mfloat-abi=hard -marm)
 endif()
-target_link_options(piai PRIVATE -Wl,--gc-sections -pthread)
+target_link_options(piai PRIVATE -Wl,--gc-sections -pthread -Wl,--as-needed)
 if(UNIX)
- target_link_libraries(piai PRIVATE pthread)
+  target_link_libraries(piai PRIVATE pthread m)
 endif()
 install(TARGETS piai RUNTIME DESTINATION bin)
