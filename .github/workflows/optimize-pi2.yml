@@ -38,9 +38,6 @@ jobs:
           if '#include <arm_neon.h>' not in s:
               s=s.replace('#include <array>','#include <array>\n#if defined(__ARM_NEON) || defined(__ARM_NEON__)\n#include <arm_neon.h>\n#endif',1)
 
-          # The old generated version accidentally contained a block that wrote
-          # through the const input pointer. Remove that block robustly, then
-          # replace the worker/dot section with the known-good implementation.
           a=s.find('static inline float dot_f16(')
           b=s.find('static MVWorkers&mv_workers()',a)
           if a<0 or b<0:
@@ -81,7 +78,50 @@ jobs:
           void run(const TensorBinding&w,const float*x,float*y,size_t r,size_t c){if(!w.tensor||!w.data||!r||!c)return;if(r<32){for(size_t i=0;i<r;i++){if(w.tensor->type==gguf::TensorType::F16)y[i]=dot_f16(w.data+i*c*2,x,c);else if(w.tensor->type==gguf::TensorType::F32)y[i]=dot_f32(w.data+i*c*4,x,c);else{float s=0.f;for(size_t j=0;j<c;j++)s+=elem(w,i*c+j)*x[j];y[i]=s;}}return;}{std::lock_guard<std::mutex>lk(mu_);w_=&w;x_=x;y_=y;r_=r;c_=c;next_.store(0,std::memory_order_relaxed);active_=workers_.size();++generation_;}cv_.notify_all();std::unique_lock<std::mutex>lk(mu_);done_.wait(lk,[&]{return active_==0;});}};
           '''
           s=s[:a]+new+s[b:]
-          s=s.replace('if(i>=189)cp=256+(uint32_t)(i-189);','if(i>=188)cp=256+(uint32_t)(i-188);')
+
+          # Avoid a full O(vocab log vocab) sort for every generated token.
+          # partial_sort keeps only the requested top-k region ordered.
+          start=s.find('static int sample(')
+          end=s.find('\nbool KVCache::init',start)
+          if start<0 or end<0:
+              raise SystemExit('sample markers not found')
+          sample=r'''static int sample(const std::vector<float>&l,const std::vector<int32_t>&hist,Sampling s,std::mt19937_64&r){
+          if(l.empty())return-1;
+          const size_t K=(s.top_k>0)?std::min<size_t>((size_t)s.top_k,l.size()):l.size();
+          std::vector<std::pair<float,int>>v;
+          v.reserve(K+1);
+          for(size_t i=0;i<l.size();i++){
+              float z=l[i];
+              if(s.repeat_penalty>1)for(auto h:hist)if(h==(int32_t)i){z=z<0?z*s.repeat_penalty:z/s.repeat_penalty;break;}
+              v.push_back({z,(int)i});
+          }
+          if(s.temperature<=0)return std::max_element(v.begin(),v.end())->second;
+          for(auto&a:v)a.first/=s.temperature;
+          if(K<v.size()){
+              std::nth_element(v.begin(),v.begin()+K,v.end(),[](const auto&a,const auto&b){return a.first>b.first;});
+              v.resize(K);
+          }
+          std::sort(v.begin(),v.end(),[](const auto&a,const auto&b){return a.first>b.first;});
+          float mx=v[0].first,sum=0;for(auto&a:v){a.first=std::exp(a.first-mx);sum+=a.first;}
+          for(auto&a:v)a.first/=sum;
+          float acc=0;size_t n=v.size();for(size_t i=0;i<v.size();i++){acc+=v[i].first;if(acc>=s.top_p){n=i+1;break;}}
+          std::uniform_real_distribution<float>u(0,1);float total=0;for(size_t i=0;i<n;i++)total+=v[i].first;float q=u(r)*total,c=0;for(size_t i=0;i<n;i++){c+=v[i].first;if(q<=c)return v[i].second;}return v[n-1].second;}
+          '''
+          s=s[:start]+sample+s[end:]
+
+          # Keep the hot RMS reduction in float; ARMv7 NEON has no native
+          # double SIMD and the model activations are float32 anyway.
+          old='static void rms(const TensorBinding&w,std::vector<float>&x,float eps){double s=0;for(float z:x)s+=(double)z*z;float k=1.f/std::sqrt((float)(s/x.size())+eps);for(size_t i=0;i<x.size();i++)x[i]*=k*elem(w,i);}'
+          newr='''static void rms(const TensorBinding&w,std::vector<float>&x,float eps){
+          float s=0.f;size_t i=0;
+          #if defined(__ARM_NEON) || defined(__ARM_NEON__)
+          float32x4_t a=vdupq_n_f32(0.f);for(;i+4<=x.size();i+=4){float32x4_t q=vld1q_f32(x.data()+i);a=vmlaq_f32(a,q,q);}float32x2_t p=vadd_f32(vget_low_f32(a),vget_high_f32(a));p=vpadd_f32(p,p);s=vget_lane_f32(p,0);
+          #endif
+          for(;i<x.size();i++)s+=x[i]*x[i];
+          float k=1.f/std::sqrt(s/(float)x.size()+eps);for(i=0;i<x.size();i++)x[i]*=k*elem(w,i);}
+          '''
+          if old in s:s=s.replace(old,newr,1)
+
           p.write_text(s)
           PY
 
@@ -90,7 +130,7 @@ jobs:
           git diff --check
           if grep -Fq 'x[i+j]=x[i+j]' src/inference_v4.cpp; then echo 'bad FP16 NEON code remains'; exit 1; fi
           if grep -Fq 'elem(*(const TensorBinding*)nullptr' src/inference_v4.cpp; then echo 'bad FP16 helper remains'; exit 1; fi
-          grep -n "dot_f16\|cortex-a7\|hardware_concurrency" src/inference_v4.cpp CMakeLists.txt
+          grep -n "dot_f16\|cortex-a7\|hardware_concurrency\|nth_element" src/inference_v4.cpp CMakeLists.txt
 
       - name: Build on CI
         run: |
@@ -102,4 +142,4 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add CMakeLists.txt src/inference_v4.cpp
-          if git diff --cached --quiet; then echo 'No optimization changes needed.'; else git commit -m 'Fix FP16 NEON inference optimization'; git push; fi
+          if git diff --cached --quiet; then echo 'No optimization changes needed.'; else git commit -m 'Optimize Pi 2B sampling and inference hot paths'; git push; fi
