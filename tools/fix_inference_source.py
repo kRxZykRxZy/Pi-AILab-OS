@@ -26,10 +26,8 @@ old = "int next=sample(logits,ids,sampling_,rng_);if(next<0)return false;ids.pus
 new = "int next=sample(logits,ids,sampling_,rng_);if(next<0)return false;uint32_t eos_id=UINT32_MAX;if(u32v(model_->metadata(\"tokenizer.ggml.eos_token_id\"),eos_id)&&next==(int)eos_id)break;ids.push_back(next);out.push_back(vocab_.decode(next));if(on_token&&!on_token(out.back()))return false;"
 text = text.replace(old, new)
 
-# Cortex-A7 has no native FP16 arithmetic. The old hf() used ldexp() for every
-# weight, which is extremely expensive. A 65536-entry lookup table turns half
-# conversion into a cache-friendly indexed load. Keep the exact IEEE conversion
-# semantics, including subnormals/Inf/NaN.
+# Cortex-A7 has no native FP16 arithmetic. Avoid repeated ldexp() calls by using
+# an exact 65536-entry IEEE half -> float lookup table. The table is only 256 KiB.
 old = 'static float hf(uint16_t h){uint32_t s=h>>15,e=(h>>10)&31,f=h&1023;if(!e)return(s?-1.f:1.f)*std::ldexp((float)f,-24);if(e==31)return f?NAN:(s?-INFINITY:INFINITY);return(s?-1.f:1.f)*std::ldexp(1.f+f/1024.f,(int)e-15);}'
 new = '''static const std::array<float,65536>& hf_table(){
     static const std::array<float,65536> t=[](){
@@ -47,7 +45,8 @@ new = '''static const std::array<float,65536>& hf_table(){
 static inline float hf(uint16_t h){return hf_table()[h];}'''
 text = text.replace(old, new)
 
-# Replace the FP16 dot kernel with a tighter NEON-friendly implementation.
+# Tighter NEON FP16 dot kernel. It avoids scalar half conversion in the hot loop,
+# uses two independent accumulators, and keeps the Cortex-A7 NEON pipeline fed.
 old_start = 'static inline float dot_f16(const uint8_t*wp,const float*x,size_t n){'
 start = text.find(old_start)
 if start >= 0:
@@ -77,8 +76,9 @@ if start >= 0:
 }'''
         text = text[:start] + new_dot + text[end+2:]
 
-# Cache RoPE sin/cos values once per generated position instead of calling
-# pow/cos/sin for every head in every layer.
+# Cache RoPE values for each position. A position is transformed for many heads
+# and every layer, so computing sin/cos once per position removes a large amount
+# of scalar libm work from every generated token.
 old = 'static void rope(float*x,size_t d,size_t pos,float theta){for(size_t i=0;i+1<d;i+=2){float a=pos*std::pow(theta,-2.f*(i/2.f)/d),c=std::cos(a),s=std::sin(a),u=x[i],v=x[i+1];x[i]=u*c-v*s;x[i+1]=u*s+v*c;}}'
 new = r'''static void rope(float*x,size_t d,size_t pos,float theta){
     struct RC{size_t d=0,pos=SIZE_MAX;float theta=0;std::vector<float>c,s;};
