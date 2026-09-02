@@ -1,6 +1,10 @@
 #include "inference.hpp"
 #include <algorithm>
+#include <atomic>
 #include <array>
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+#endif
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
@@ -25,7 +29,42 @@ static float elem(const TensorBinding&t,size_t i){if(!t.tensor||!t.data)return 0
 
 // Persistent workers use every hardware thread reported by the CPU. Each worker
 // claims independent output rows without launching threads per token.
-class MVWorkers{std::vector<std::thread>workers_;std::mutex mu_;std::condition_variable cv_,done_;const TensorBinding*w_=nullptr;const float*x_=nullptr;float*y_=nullptr;size_t r_=0,c_=0,next_=0,active_=0,generation_=0;bool stop_=false;void worker(){size_t seen=0;for(;;){std::unique_lock<std::mutex>lk(mu_);cv_.wait(lk,[&]{return stop_||generation_!=seen;});if(stop_)return;seen=generation_;const TensorBinding*w=w_;const float*x=x_;float*y=y_;size_t r=r_,c=c_;lk.unlock();for(;;){size_t i;{std::lock_guard<std::mutex>g(mu_);if(next_>=r)break;i=next_++;}double s=0.0;for(size_t j=0;j<c;j++)s+=(double)elem(*w,i*c+j)*x[j];y[i]=(float)s;}lk.lock();if(--active_==0)done_.notify_one();}}public:MVWorkers(){unsigned n=std::thread::hardware_concurrency();if(n==0)n=1;workers_.reserve(n);for(unsigned k=0;k<n;k++)workers_.emplace_back(&MVWorkers::worker,this);}~MVWorkers(){std::lock_guard<std::mutex>lk(mu_);stop_=true;cv_.notify_all();for(auto&i:workers_)if(i.joinable())i.join();}void run(const TensorBinding&w,const float*x,float*y,size_t r,size_t c){if(r<64){for(size_t i=0;i<r;i++){double s=0;for(size_t j=0;j<c;j++)s+=(double)elem(w,i*c+j)*x[j];y[i]=(float)s;}return;}{std::lock_guard<std::mutex>lk(mu_);w_=&w;x_=x;y_=y;r_=r;c_=c;next_=0;active_=workers_.size();++generation_;}cv_.notify_all();std::unique_lock<std::mutex>lk(mu_);done_.wait(lk,[&]{return active_==0;});}};
+static inline float dot_f16(const uint8_t*wp,const float*x,size_t n){
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    float32x4_t acc=vdupq_n_f32(0.f);size_t i=0;
+    for(;i+4<=n;i+=4){
+        const uint16_t* w=reinterpret_cast<const uint16_t*>(wp+i*2);
+        uint16x4_t h16=vld1_u16(w);uint32x4_t h32=vmovl_u16(h16);
+        bool special=((h16[0]&0x7c00u)==0)||((h16[1]&0x7c00u)==0)||((h16[2]&0x7c00u)==0)||((h16[3]&0x7c00u)==0)||((h16[0]&0x7c00u)==0x7c00u)||((h16[1]&0x7c00u)==0x7c00u)||((h16[2]&0x7c00u)==0x7c00u)||((h16[3]&0x7c00u)==0x7c00u);
+        if(special){for(size_t j=0;j<4;j++){uint16_t q;std::memcpy(&q,wp+(i+j)*2,2);acc=vsetq_lane_f32(vget_lane_f32(vget_low_f32(acc),0),acc,0);/* exact specials handled below */x[i+j]=x[i+j];}
+            float z=0.f;for(size_t j=0;j<4;j++){uint16_t q;std::memcpy(&q,wp+(i+j)*2,2);z+=elem(*(const TensorBinding*)nullptr,0)*0.f;z+=hf(q)*x[i+j];} /* unreachable type-safe helper is avoided below */
+        }
+        uint32x4_t sign=vshlq_n_u32(vandq_u32(h32,vdupq_n_u32(0x8000u)),16);
+        uint32x4_t exp=vaddq_u32(vshlq_n_u32(vandq_u32(h32,vdupq_n_u32(0x7c00u)),13),vdupq_n_u32(112u<<23));
+        uint32x4_t mant=vshlq_n_u32(vandq_u32(h32,vdupq_n_u32(0x03ffu)),13);
+        float32x4_t wf=vreinterpretq_f32_u32(vorrq_u32(sign,vorrq_u32(exp,mant)));
+        if(special){for(size_t j=0;j<4;j++){uint16_t q;std::memcpy(&q,wp+(i+j)*2,2);wf=vsetq_lane_f32(hf(q),wf,j);}}
+        acc=vmlaq_f32(acc,vld1q_f32(x+i),wf);
+    }
+    float32x2_t p=vadd_f32(vget_low_f32(acc),vget_high_f32(acc));p=vpadd_f32(p,p);float out=vget_lane_f32(p,0);
+    for(;i<n;i++){uint16_t q;std::memcpy(&q,wp+i*2,2);out+=hf(q)*x[i];}return out;
+#else
+    float out=0.f;for(size_t i=0;i<n;i++){uint16_t q;std::memcpy(&q,wp+i*2,2);out+=hf(q)*x[i];}return out;
+#endif
+}
+
+static inline float dot_f32(const uint8_t*wp,const float*x,size_t n){
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    const float*w=reinterpret_cast<const float*>(wp);float32x4_t acc=vdupq_n_f32(0.f);size_t i=0;for(;i+4<=n;i+=4)acc=vmlaq_f32(acc,vld1q_f32(x+i),vld1q_f32(w+i));float32x2_t p=vadd_f32(vget_low_f32(acc),vget_high_f32(acc));p=vpadd_f32(p,p);float out=vget_lane_f32(p,0);for(;i<n;i++)out+=x[i]*w[i];return out;
+#else
+    const float*w=reinterpret_cast<const float*>(wp);float out=0.f;for(size_t i=0;i<n;i++)out+=x[i]*w[i];return out;
+#endif
+}
+
+class MVWorkers{std::vector<std::thread>workers_;std::mutex mu_;std::condition_variable cv_,done_;const TensorBinding*w_=nullptr;const float*x_=nullptr;float*y_=nullptr;size_t r_=0,c_=0;std::atomic<size_t>next_{0};size_t active_=0,generation_=0;bool stop_=false;
+void worker(){size_t seen=0;for(;;){std::unique_lock<std::mutex>lk(mu_);cv_.wait(lk,[&]{return stop_||generation_!=seen;});if(stop_)return;seen=generation_;const TensorBinding*w=w_;const float*x=x_;float*y=y_;size_t r=r_,c=c_;lk.unlock();for(;;){size_t i=next_.fetch_add(1,std::memory_order_relaxed);if(i>=r)break;const uint8_t*base=w->data;if(w->tensor->type==gguf::TensorType::F16)y[i]=dot_f16(base+i*c*2,x,c);else if(w->tensor->type==gguf::TensorType::F32)y[i]=dot_f32(base+i*c*4,x,c);else{float s=0.f;for(size_t j=0;j<c;j++)s+=elem(*w,i*c+j)*x[j];y[i]=s;}}lk.lock();if(--active_==0)done_.notify_one();}}
+public:MVWorkers(){unsigned n=std::thread::hardware_concurrency();if(n==0)n=1;workers_.reserve(n);for(unsigned i=0;i<n;i++)workers_.emplace_back(&MVWorkers::worker,this);}~MVWorkers(){{std::lock_guard<std::mutex>lk(mu_);stop_=true;cv_.notify_all();}for(auto&i:workers_)if(i.joinable())i.join();}
+void run(const TensorBinding&w,const float*x,float*y,size_t r,size_t c){if(!w.tensor||!w.data||!r||!c)return;if(r<32){for(size_t i=0;i<r;i++){if(w.tensor->type==gguf::TensorType::F16)y[i]=dot_f16(w.data+i*c*2,x,c);else if(w.tensor->type==gguf::TensorType::F32)y[i]=dot_f32(w.data+i*c*4,x,c);else{float s=0.f;for(size_t j=0;j<c;j++)s+=elem(w,i*c+j)*x[j];y[i]=s;}}return;}{std::lock_guard<std::mutex>lk(mu_);w_=&w;x_=x;y_=y;r_=r;c_=c;next_.store(0,std::memory_order_relaxed);active_=workers_.size();++generation_;}cv_.notify_all();std::unique_lock<std::mutex>lk(mu_);done_.wait(lk,[&]{return active_==0;});}};
 static MVWorkers&mv_workers(){static MVWorkers p;return p;}
 static void mv(const TensorBinding&w,const float*x,float*y,size_t r,size_t c){mv_workers().run(w,x,y,r,c);}
 
@@ -40,7 +79,7 @@ struct TokState{std::unordered_map<std::string,int32_t> id;std::unordered_map<st
 static std::unordered_map<const Vocabulary*,TokState> states;
 static std::string u8cp(uint32_t cp){std::string s;if(cp<0x80)s.push_back((char)cp);else if(cp<0x800){s.push_back((char)(0xC0|(cp>>6)));s.push_back((char)(0x80|(cp&63)));}else if(cp<0x10000){s.push_back((char)(0xE0|(cp>>12)));s.push_back((char)(0x80|((cp>>6)&63)));s.push_back((char)(0x80|(cp&63)));}else{s.push_back((char)(0xF0|(cp>>18)));s.push_back((char)(0x80|((cp>>12)&63)));s.push_back((char)(0x80|((cp>>6)&63)));s.push_back((char)(0x80|(cp&63)));}return s;}
 static std::vector<uint32_t> cps(const std::string&s){std::vector<uint32_t>o;for(size_t i=0;i<s.size();){uint8_t c=(uint8_t)s[i++];if(c<0x80)o.push_back(c);else if((c>>5)==6&&i<s.size())o.push_back(((c&31)<<6)|((uint8_t)s[i++]&63));else if((c>>4)==14&&i+1<s.size())o.push_back(((c&15)<<12)|(((uint8_t)s[i++]&63)<<6)|((uint8_t)s[i++]&63));else if((c>>3)==30&&i+2<s.size())o.push_back(((c&7)<<18)|(((uint8_t)s[i++]&63)<<12)|(((uint8_t)s[i++]&63)<<6)|((uint8_t)s[i++]&63));else o.push_back(0xFFFD);}return o;}
-static std::array<std::string,256> byte_enc(){std::array<std::string,256>a;std::vector<int>bs;for(int b=33;b<=126;b++)bs.push_back(b);for(int b=161;b<=172;b++)bs.push_back(b);for(int b=174;b<=255;b++)bs.push_back(b);std::array<bool,256>used{};for(int b:bs)used[b]=true;for(int b=0;b<256;b++)if(!used[b])bs.push_back(b);for(size_t i=0;i<bs.size();i++){int b=bs[i];uint32_t cp=(uint32_t)b;if(i>=189)cp=256+(uint32_t)(i-189);a[b]=u8cp(cp);}return a;}
+static std::array<std::string,256> byte_enc(){std::array<std::string,256>a;std::vector<int>bs;for(int b=33;b<=126;b++)bs.push_back(b);for(int b=161;b<=172;b++)bs.push_back(b);for(int b=174;b<=255;b++)bs.push_back(b);std::array<bool,256>used{};for(int b:bs)used[b]=true;for(int b=0;b<256;b++)if(!used[b])bs.push_back(b);for(size_t i=0;i<bs.size();i++){int b=bs[i];uint32_t cp=(uint32_t)b;if(i>=188)cp=256+(uint32_t)(i-188);a[b]=u8cp(cp);}return a;}
 static std::string byte_decode(const std::string&s){static const auto enc=byte_enc();std::unordered_map<uint32_t,uint8_t>rev;for(int b=0;b<256;b++)for(uint32_t cp:cps(enc[b]))rev[cp]=(uint8_t)b;std::string r;for(uint32_t cp:cps(s)){auto it=rev.find(cp);if(it!=rev.end())r.push_back((char)it->second);else r+=u8cp(cp);}return r;}
 static bool is_ascii_letter(uint8_t c){return(c>='A'&&c<='Z')||(c>='a'&&c<='z');}static bool is_digit(uint8_t c){return c>='0'&&c<='9';}static bool is_space(uint8_t c){return c==' '||c=='\t'||c=='\n'||c=='\r'||c=='\f'||c=='\v';}static bool is_punct(uint8_t c){return !is_ascii_letter(c)&&!is_digit(c)&&!is_space(c);}
 static std::vector<std::string> smollm_split(const std::string&s){std::vector<std::string>out;size_t p=0,n=s.size();while(p<n){size_t st=p;if(s[p]=='\''&&p+1<n){size_t e=p+1;if((s[e]=='s'||s[e]=='S'||s[e]=='t'||s[e]=='T'||s[e]=='m'||s[e]=='M'||s[e]=='d'||s[e]=='D')&&e+1<=n){out.push_back(s.substr(p,2));p+=2;continue;}if((s[e]=='r'||s[e]=='R'||s[e]=='v'||s[e]=='V'||s[e]=='l'||s[e]=='L')&&e+2<n&&(s[e+1]=='e'||s[e+1]=='E'||s[e+1]=='l'||s[e+1]=='L')){out.push_back(s.substr(p,3));p+=3;continue;}}if(is_space((uint8_t)s[p])){while(p<n&&is_space((uint8_t)s[p]))p++;out.push_back(s.substr(st,p-st));continue;}if(is_digit((uint8_t)s[p])){while(p<n&&is_digit((uint8_t)s[p]))p++;out.push_back(s.substr(st,p-st));continue;}if(is_ascii_letter((uint8_t)s[p])||s[p]>=0x80){while(p<n&&(is_ascii_letter((uint8_t)s[p])||s[p]>=0x80))p++;out.push_back(s.substr(st,p-st));continue;}if(is_punct((uint8_t)s[p])){while(p<n&&is_punct((uint8_t)s[p]))p++;out.push_back(s.substr(st,p-st));continue;}p++;out.push_back(s.substr(st,1));}return out;}
