@@ -10,7 +10,8 @@ namespace piai::compute::vc4_kernel {
 //
 // This table is populated only when a validated VC4 program is supplied.
 // A zero-size program makes the backend fail closed rather than executing an
-// unverified instruction stream on the GPU.
-inline constexpr uint8_t vector_add[] = {};
+// unverified instruction stream on the GPU. C++ does not permit a zero-length
+// built-in array, so keep one inert byte while reporting a logical size of 0.
+inline constexpr uint8_t vector_add[1] = {0};
 inline constexpr std::size_t vector_add_size = 0;
 }
