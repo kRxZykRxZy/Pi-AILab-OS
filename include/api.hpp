@@ -18,7 +18,7 @@ public:
  ~Server(); bool listen(uint16_t port=5453); void stop(); void serve_once(); void serve_forever(); bool running()const{return running_;} uint16_t port()const{return port_;}
 private:
  Response route(const Request&); Response json(int,const std::string&);
- Response load_model(const std::string&); Response generate(const Request&,const std::string&); void stream_generate(int,const Request&,const std::string&);
+ Response load_model(const std::string&); Response unload_model(); Response generate(const Request&,const std::string&); void stream_generate(int,const Request&,const std::string&);
  static std::string url_path(const std::string&); static std::string reason(int); static std::string json_escape(const std::string&);
 };
 }
