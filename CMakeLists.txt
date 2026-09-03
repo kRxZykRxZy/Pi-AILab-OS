@@ -24,7 +24,7 @@ add_custom_target(piai_inference_source DEPENDS ${PAIBACKEND})
 add_executable(piai
   src/main.cpp src/gguf_v3.cpp src/quant.cpp src/transformer.cpp src/api.cpp src/runtime.cpp
   src/platform.cpp src/platform/pi_models.cpp src/compute/dot.cpp src/compute/vc4_qpu.cpp
-  src/compute/vc4_memory.cpp
+  src/compute/vc4_memory.cpp src/compute/vc4_runtime.cpp
   src/inference/cache.cpp src/inference/rope.cpp src/inference_parallel.cpp src/architecture_v2.cpp)
 add_dependencies(piai piai_inference_source)
 target_include_directories(piai PRIVATE include ${CMAKE_CURRENT_BINARY_DIR}/generated)
