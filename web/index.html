@@ -37,7 +37,18 @@
     <form id="composer" class="composer">
       <textarea id="prompt" rows="1" placeholder="Message Pi AI Lab…" autocomplete="off"></textarea>
       <button id="send" class="send" type="submit" aria-label="Send">↑</button>
-      <div class="meta"><span id="status">Connecting…</span><span id="modelName">No model loaded</span></div>
+      <div class="meta">
+        <span id="status">Connecting…</span>
+        <span id="modelName">No model loaded</span>
+        <label class="modeSelect" title="Inference device">
+          <span>Run on</span>
+          <select id="inferenceMode" aria-label="Inference mode">
+            <option value="cpu">CPU</option>
+            <option value="gpu">GPU</option>
+            <option value="both">CPU + GPU</option>
+          </select>
+        </label>
+      </div>
     </form>
   </main>
   <script src="/app.js"></script>
