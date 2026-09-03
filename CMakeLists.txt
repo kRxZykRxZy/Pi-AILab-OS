@@ -15,7 +15,7 @@ add_executable(piai
   src/platform.cpp src/platform/pi_models.cpp src/compute/dot.cpp src/compute/vc4_qpu.cpp
   src/compute/vc4_memory.cpp src/compute/vc4_runtime.cpp src/compute/vc4_compute.cpp
   src/inference/cache.cpp src/inference/rope.cpp src/inference/mode.cpp
-  src/inference_v4.cpp src/inference_parallel.cpp src/architecture_v2.cpp)
+  src/inference_v4.cpp src/architecture_v2.cpp)
 target_include_directories(piai PRIVATE include)
 target_compile_options(piai PRIVATE -Wall -Wextra -Wpedantic -O3 -ffast-math -funsafe-math-optimizations -fno-math-errno -fno-trapping-math -ftree-vectorize -ftree-slp-vectorize -fomit-frame-pointer -ffunction-sections -fdata-sections -pthread)
 
