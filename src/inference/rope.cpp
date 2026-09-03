@@ -1,5 +1,6 @@
 #include "piai/inference/rope.hpp"
 #include <cmath>
+#include <cstdint>
 #include <limits>
 #include <vector>
 
