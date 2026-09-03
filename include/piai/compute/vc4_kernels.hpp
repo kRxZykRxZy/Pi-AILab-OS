@@ -3,15 +3,30 @@
 #include <cstdint>
 
 namespace piai::compute::vc4_kernel {
-// Minimal hand-encoded VC4 QPU program used by the runtime smoke test.
-// The program loads two 16-float rows through DMA/VPM, adds them, stores one
-// row, and terminates. The instruction stream is intentionally kept in the
-// source tree so builds have no Python or assembler dependency.
+// Hand-encoded VideoCore IV QPU program. It follows the documented 64-bit
+// instruction layout and uses the VPM DMA path:
+//   uniform[0] -> input (two contiguous 16-float rows)
+//   uniform[1] -> output (one 16-float row)
+// The first row and second row are added lane-wise and written back.
 //
-// This table is populated only when a validated VC4 program is supplied.
-// A zero-size program makes the backend fail closed rather than executing an
-// unverified instruction stream on the GPU. C++ does not permit a zero-length
-// built-in array, so keep one inert byte while reporting a logical size of 0.
-inline constexpr uint8_t vector_add[1] = {0};
-inline constexpr std::size_t vector_add_size = 0;
+// The program is deliberately kept as raw QPU words so the project has no
+// Python or assembler dependency at runtime or build time.
+inline constexpr uint64_t vector_add[] = {
+    0xe0024c6783021000ULL,
+    0x10024ca715820d80ULL,
+    0x100249e715cb2d80ULL,
+    0xe0024c6700201000ULL,
+    0xe0024c6700001a00ULL,
+    0x1002402715c30d80ULL,
+    0x1002406715c30d80ULL,
+    0x10024c27019e7040ULL,
+    0xe0024c6780904000ULL,
+    0x10024ca715820d80ULL,
+    0x100249e715cb2d80ULL,
+    0x30024027159e7000ULL,
+    0x10024027159e7000ULL,
+    0x100249e7009e7000ULL,
+    0x100249e7009e7000ULL
+};
+inline constexpr std::size_t vector_add_size = sizeof(vector_add);
 }
