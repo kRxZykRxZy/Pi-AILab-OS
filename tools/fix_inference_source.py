@@ -35,7 +35,7 @@ new = '''static const std::array<float,65536>& hf_table(){
         for(uint32_t h=0;h<65536;h++){
             uint32_t s=h>>15,e=(h>>10)&31,f=h&1023;
             if(!e) a[h]=(s?-1.f:1.f)*std::ldexp((float)f,-24);
-            else if(e==31) a[h]=f?NAN:(s?-INFINITY:INFINITY);
+            else if(e==31) a[h]=f?NAN:(s?-1.f:1.f)*std::ldexp(1.f+f/1024.f,(int)e-15);
             else a[h]=(s?-1.f:1.f)*std::ldexp(1.f+f/1024.f,(int)e-15);
         }
         return a;
@@ -43,9 +43,6 @@ new = '''static const std::array<float,65536>& hf_table(){
     return t;
 }
 static inline float hf(uint16_t h){return hf_table()[h];}'''
-# Support the exact source currently in the repository as well as the older variant.
-if old not in text:
-    old = 'static float hf(uint16_t h){uint32_t s=h>>15,e=(h>>10)&31,f=h&1023;if(!e)return(s?-1.f:1.f)*std::ldexp((float)f,-24);if(e==31)return f?NAN:(s?-1.f:1.f)*std::ldexp(1.f+f/1024.f,(int)e-15);}'
 text = text.replace(old, new)
 
 # Tighter NEON FP16 dot kernel. It uses two accumulators and a half->float lookup
@@ -103,7 +100,7 @@ old = "cache_.clear();size_t hd=arch_.hidden/arch_.heads;std::vector<float>x(arc
 new = "cache_.clear();size_t hd=arch_.hidden/arch_.heads;std::vector<float>x(arch_.hidden),z(arch_.hidden),q(arch_.hidden),kk(arch_.kv_heads*hd),vv(arch_.kv_heads*hd),a(arch_.hidden),logits(arch_.vocab),sc,ffng,ffnu,ffnd;sc.reserve(arch_.context);ffng.resize(arch_.intermediate);ffnu.resize(arch_.intermediate);ffnd.resize(arch_.hidden);"
 text = text.replace(old, new)
 text = text.replace("std::vector<float>sc(pos+1);float mx=", "sc.resize(pos+1);float mx=")
-text = text.replace("std::vector<float>g(arch_.intermediate),u(arch_.intermediate),d(arch_.hidden);mv(ffn1_[l],z.data(),g.data(),arch_.intermediate,arch_.hidden);if(ffn3_[l].tensor)mv(ffn3_[l],z.data(),u.data(),arch_.intermediate,arch_.hidden);else u=g;", "ffng.assign(arch_.intermediate,0.f);ffnu.assign(arch_.intermediate,0.f);ffnd.assign(arch_.hidden,0.f);mv(ffn1_[l],z.data(),ffng.data(),arch_.intermediate,arch_.hidden);if(ffn3_[l].tensor)mv(ffn3_[l],z.data(),ffnu.data(),arch_.intermediate,arch_.hidden);else ffnu=ffng;")
+text = text.replace("std::vector<float>g(arch_.intermediate),u(arch_.intermediate),d(arch_.hidden);mv(ffn1_[l],z.data(),g.data(),arch_.intermediate,arch_.hidden);if(ffn3_[l].tensor)mv(ffn3_[l],z.data(),u.data(),arch_.intermediate,arch_.hidden);else u=g;", "mv(ffn1_[l],z.data(),ffng.data(),arch_.intermediate,arch_.hidden);if(ffn3_[l].tensor)mv(ffn3_[l],z.data(),ffnu.data(),arch_.intermediate,arch_.hidden);else std::copy(ffng.begin(),ffng.end(),ffnu.begin());")
 text = text.replace("for(size_t i=0;i<g.size();i++){float t=g[i];float sig=", "for(size_t i=0;i<ffng.size();i++){float t=ffng[i];float sig=")
 text = text.replace("g[i]=(t*sig)*u[i];}mv(ffn2_[l],g.data(),d.data(),arch_.hidden,arch_.intermediate);for(size_t i=0;i<arch_.hidden;i++)x[i]+=d[i];", "ffng[i]=(t*sig)*ffnu[i];}mv(ffn2_[l],ffng.data(),ffnd.data(),arch_.hidden,arch_.intermediate);for(size_t i=0;i<arch_.hidden;i++)x[i]+=ffnd[i];")
 
