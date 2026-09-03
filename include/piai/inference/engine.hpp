@@ -2,6 +2,7 @@
 
 #include "gguf.hpp"
 #include "piai/inference/cache.hpp"
+#include "piai/inference/mode.hpp"
 #include "piai/inference/rope.hpp"
 #include "piai/inference/tokenizer.hpp"
 #include "piai/inference/types.hpp"
@@ -29,6 +30,12 @@ public:
     bool load(const gguf::Model& model);
     bool generate(const std::string& prompt, size_t max_tokens,
                   std::vector<std::string>& out,
+                  const std::function<bool(const std::string&)>& on_token = {});
+    // Explicit execution-mode entry point. GPU mode is fail-closed: it must
+    // execute through the VC4 backend and never silently fall back to CPU.
+    bool generate(const std::string& prompt, size_t max_tokens,
+                  std::vector<std::string>& out,
+                  InferenceMode mode,
                   const std::function<bool(const std::string&)>& on_token = {});
     const Architecture& architecture() const { return arch_; }
     const TensorBinding& embedding() const { return embedding_; }
