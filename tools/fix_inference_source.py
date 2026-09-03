@@ -26,9 +26,9 @@ old = "int next=sample(logits,ids,sampling_,rng_);if(next<0)return false;ids.pus
 new = "int next=sample(logits,ids,sampling_,rng_);if(next<0)return false;uint32_t eos_id=UINT32_MAX;if(u32v(model_->metadata(\"tokenizer.ggml.eos_token_id\"),eos_id)&&next==(int)eos_id)break;ids.push_back(next);out.push_back(vocab_.decode(next));if(on_token&&!on_token(out.back()))return false;"
 text = text.replace(old, new)
 
-# Cortex-A7 has no native FP16 arithmetic. Avoid repeated ldexp() calls by using
-# an exact 65536-entry IEEE half -> float lookup table. The table is only 256 KiB.
-old = 'static float hf(uint16_t h){uint32_t s=h>>15,e=(h>>10)&31,f=h&1023;if(!e)return(s?-1.f:1.f)*std::ldexp((float)f,-24);if(e==31)return f?NAN:(s?-INFINITY:INFINITY);return(s?-1.f:1.f)*std::ldexp(1.f+f/1024.f,(int)e-15);}'
+# Cortex-A7 has no native FP16 arithmetic. Avoid repeated half conversion math by
+# using an exact 65536-entry IEEE half -> float lookup table. The table is 256 KiB.
+old = 'static float hf(uint16_t h){uint32_t s=h>>15,e=(h>>10)&31,f=h&1023;if(!e)return(s?-1.f:1.f)*std::ldexp((float)f,-24);if(e==31)return f?NAN:(s?-1.f:1.f)*std::ldexp(1.f+f/1024.f,(int)e-15);}'
 new = '''static const std::array<float,65536>& hf_table(){
     static const std::array<float,65536> t=[](){
         std::array<float,65536> a{};
@@ -43,10 +43,13 @@ new = '''static const std::array<float,65536>& hf_table(){
     return t;
 }
 static inline float hf(uint16_t h){return hf_table()[h];}'''
+# Support the exact source currently in the repository as well as the older variant.
+if old not in text:
+    old = 'static float hf(uint16_t h){uint32_t s=h>>15,e=(h>>10)&31,f=h&1023;if(!e)return(s?-1.f:1.f)*std::ldexp((float)f,-24);if(e==31)return f?NAN:(s?-1.f:1.f)*std::ldexp(1.f+f/1024.f,(int)e-15);}'
 text = text.replace(old, new)
 
-# Tighter NEON FP16 dot kernel. It avoids scalar half conversion in the hot loop,
-# uses two independent accumulators, and keeps the Cortex-A7 NEON pipeline fed.
+# Tighter NEON FP16 dot kernel. It uses two accumulators and a half->float lookup
+# instead of scalar conversion work in the inner product.
 old_start = 'static inline float dot_f16(const uint8_t*wp,const float*x,size_t n){'
 start = text.find(old_start)
 if start >= 0:
@@ -76,9 +79,8 @@ if start >= 0:
 }'''
         text = text[:start] + new_dot + text[end+2:]
 
-# Cache RoPE values for each position. A position is transformed for many heads
-# and every layer, so computing sin/cos once per position removes a large amount
-# of scalar libm work from every generated token.
+# Cache RoPE values for each position. Avoid repeated pow/cos/sin calls for every
+# layer and head at the same position.
 old = 'static void rope(float*x,size_t d,size_t pos,float theta){for(size_t i=0;i+1<d;i+=2){float a=pos*std::pow(theta,-2.f*(i/2.f)/d),c=std::cos(a),s=std::sin(a),u=x[i],v=x[i+1];x[i]=u*c-v*s;x[i+1]=u*s+v*c;}}'
 new = r'''static void rope(float*x,size_t d,size_t pos,float theta){
     struct RC{size_t d=0,pos=SIZE_MAX;float theta=0;std::vector<float>c,s;};
@@ -89,6 +91,31 @@ new = r'''static void rope(float*x,size_t d,size_t pos,float theta){
     }
     for(size_t i=0,j=0;i+1<d;i+=2,j++){float c=rc.c[j],s=rc.s[j],u=x[i],v=x[i+1];x[i]=u*c-v*s;x[i+1]=u*s+v*c;}
 }'''
+text = text.replace(old, new)
+
+# Do not memset the entire KV cache at the start of every request. Every position
+# used by inference is overwritten before it is read, so this is pure startup cost.
+text = text.replace("void KVCache::clear(){used_=0;std::fill(k_.begin(),k_.end(),0);std::fill(v_.begin(),v_.end(),0);}", "void KVCache::clear(){used_=0;}")
+
+# Reuse generation scratch buffers. The old code allocated vectors inside every
+# token and every layer, which is especially expensive on the Pi 2 allocator.
+old = "cache_.clear();size_t hd=arch_.hidden/arch_.heads;std::vector<float>x(arch_.hidden),z(arch_.hidden),q(arch_.hidden),kk(arch_.kv_heads*hd),vv(arch_.kv_heads*hd),a(arch_.hidden),logits(arch_.vocab);"
+new = "cache_.clear();size_t hd=arch_.hidden/arch_.heads;std::vector<float>x(arch_.hidden),z(arch_.hidden),q(arch_.hidden),kk(arch_.kv_heads*hd),vv(arch_.kv_heads*hd),a(arch_.hidden),logits(arch_.vocab),sc,ffng,ffnu,ffnd;sc.reserve(arch_.context);ffng.resize(arch_.intermediate);ffnu.resize(arch_.intermediate);ffnd.resize(arch_.hidden);"
+text = text.replace(old, new)
+text = text.replace("std::vector<float>sc(pos+1);float mx=", "sc.resize(pos+1);float mx=")
+text = text.replace("std::vector<float>g(arch_.intermediate),u(arch_.intermediate),d(arch_.hidden);mv(ffn1_[l],z.data(),g.data(),arch_.intermediate,arch_.hidden);if(ffn3_[l].tensor)mv(ffn3_[l],z.data(),u.data(),arch_.intermediate,arch_.hidden);else u=g;", "ffng.assign(arch_.intermediate,0.f);ffnu.assign(arch_.intermediate,0.f);ffnd.assign(arch_.hidden,0.f);mv(ffn1_[l],z.data(),ffng.data(),arch_.intermediate,arch_.hidden);if(ffn3_[l].tensor)mv(ffn3_[l],z.data(),ffnu.data(),arch_.intermediate,arch_.hidden);else ffnu=ffng;")
+text = text.replace("for(size_t i=0;i<g.size();i++){float t=g[i];float sig=", "for(size_t i=0;i<ffng.size();i++){float t=ffng[i];float sig=")
+text = text.replace("g[i]=(t*sig)*u[i];}mv(ffn2_[l],g.data(),d.data(),arch_.hidden,arch_.intermediate);for(size_t i=0;i<arch_.hidden;i++)x[i]+=d[i];", "ffng[i]=(t*sig)*ffnu[i];}mv(ffn2_[l],ffng.data(),ffnd.data(),arch_.hidden,arch_.intermediate);for(size_t i=0;i<arch_.hidden;i++)x[i]+=ffnd[i];")
+
+# Compute attention scores with the existing NEON F32 dot kernel instead of a
+# scalar inner loop. This is used for every head and every previous position.
+old = "sc[pp]=0;for(size_t j=0;j<hd;j++)sc[pp]+=q[h*hd+j]*cache_.key(l,pp,kh)[j];sc[pp]/=std::sqrt((float)hd);"
+new = "sc[pp]=dot_f32(reinterpret_cast<const uint8_t*>(q.data()+h*hd),cache_.key(l,pp,kh),hd)/std::sqrt((float)hd);"
+text = text.replace(old, new)
+
+# Accumulate attention values in position-major order so KV reads are contiguous.
+old = "for(size_t j=0;j<hd;j++){float u=0;for(size_t pp=0;pp<=pos;pp++)u+=sc[pp]*cache_.value(l,pp,kh)[j];a[h*hd+j]=u;}"
+new = "std::fill(a.begin()+h*hd,a.begin()+(h+1)*hd,0.f);for(size_t pp=0;pp<=pos;pp++){const float*vvv=cache_.value(l,pp,kh);float wgt=sc[pp];for(size_t j=0;j<hd;j++)a[h*hd+j]+=wgt*vvv[j];}"
 text = text.replace(old, new)
 
 dst.parent.mkdir(parents=True, exist_ok=True)
