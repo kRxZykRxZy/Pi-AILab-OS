@@ -2,6 +2,7 @@
 
 #include "gguf.hpp"
 #include "piai/inference/cache.hpp"
+#include "piai/inference/rope.hpp"
 #include "piai/inference/tokenizer.hpp"
 #include "piai/inference/types.hpp"
 #include <functional>
