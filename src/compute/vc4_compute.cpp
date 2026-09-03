@@ -16,9 +16,6 @@ bool vc4_vector_add(const float* a, const float* b, float* out, size_t n) {
     const VC4RuntimeInfo info = vc4_runtime_info();
     if (!info.qpu || info.qpus == 0) return false;
 
-    // Each QPU receives one contiguous 32-float tile:
-    //   [a0..a15][b0..b15]
-    // This matches the kernel's two-row VPM DMA load exactly.
     constexpr size_t width = 16;
     const size_t max_vectors = std::min<size_t>(info.qpus, 12);
     size_t done = 0;
@@ -38,8 +35,6 @@ bool vc4_vector_add(const float* a, const float* b, float* out, size_t n) {
             std::memcpy(in + q * width * 2 + width, b + done + base, width * sizeof(float));
         }
 
-        // The kernel consumes two uniforms: the tile input address and output
-        // address. One independent uniform block is supplied per QPU thread.
         std::vector<uint32_t> uniforms(vectors * 2);
         for (size_t q = 0; q < vectors; ++q) {
             const uint32_t in_off = static_cast<uint32_t>(q * width * 2 * sizeof(float));
@@ -48,7 +43,8 @@ bool vc4_vector_add(const float* a, const float* b, float* out, size_t n) {
             uniforms[q * 2 + 1] = out_mem.bus_address() + out_off;
         }
 
-        if (!vc4_execute_program(vc4_kernel::vector_add,
+        const auto* program = reinterpret_cast<const uint8_t*>(vc4_kernel::vector_add);
+        if (!vc4_execute_program(program,
                                  vc4_kernel::vector_add_size,
                                  uniforms.data(), 2,
                                  static_cast<unsigned>(vectors), 1000)) {
