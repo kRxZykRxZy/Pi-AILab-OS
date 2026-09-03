@@ -8,6 +8,7 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 option(PIAI_NATIVE "Tune for the CPU performing the build" ON)
 option(PIAI_VC4_QPU "Enable experimental direct VideoCore IV QPU backend" ON)
+option(PIAI_VC4_REQUIRED "Refuse CPU inference when VC4 QPU execution is unavailable" OFF)
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
 set(PAIGEN ${CMAKE_CURRENT_BINARY_DIR}/generated/inference_v4.cpp)
@@ -23,6 +24,7 @@ add_custom_target(piai_inference_source DEPENDS ${PAIBACKEND})
 add_executable(piai
   src/main.cpp src/gguf_v3.cpp src/quant.cpp src/transformer.cpp src/api.cpp src/runtime.cpp
   src/platform.cpp src/platform/pi_models.cpp src/compute/dot.cpp src/compute/vc4_qpu.cpp
+  src/compute/vc4_memory.cpp
   src/inference/cache.cpp src/inference/rope.cpp src/inference_parallel.cpp src/architecture_v2.cpp)
 add_dependencies(piai piai_inference_source)
 target_include_directories(piai PRIVATE include ${CMAKE_CURRENT_BINARY_DIR}/generated)
@@ -40,6 +42,9 @@ endif()
 
 if(PIAI_VC4_QPU)
   target_compile_definitions(piai PRIVATE PIAI_ENABLE_VC4_QPU=1)
+endif()
+if(PIAI_VC4_REQUIRED)
+  target_compile_definitions(piai PRIVATE PIAI_VC4_REQUIRED=1)
 endif()
 
 target_link_options(piai PRIVATE -Wl,--gc-sections -pthread -Wl,--as-needed)
