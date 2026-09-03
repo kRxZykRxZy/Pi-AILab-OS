@@ -19,7 +19,8 @@ add_custom_command(OUTPUT ${PAIBACKEND}
 add_custom_target(piai_inference_source DEPENDS ${PAIBACKEND})
 add_executable(piai
   src/main.cpp src/gguf_v3.cpp src/quant.cpp src/transformer.cpp src/api.cpp src/runtime.cpp
-  src/platform.cpp src/platform/pi_models.cpp src/compute/dot.cpp src/inference_parallel.cpp src/architecture_v2.cpp)
+  src/platform.cpp src/platform/pi_models.cpp src/compute/dot.cpp
+  src/inference/cache.cpp src/inference/rope.cpp src/inference_parallel.cpp src/architecture_v2.cpp)
 add_dependencies(piai piai_inference_source)
 target_include_directories(piai PRIVATE include ${CMAKE_CURRENT_BINARY_DIR}/generated)
 target_compile_options(piai PRIVATE -Wall -Wextra -Wpedantic -O3 -ffast-math -funsafe-math-optimizations -fno-math-errno -fno-trapping-math -ftree-vectorize -ftree-slp-vectorize -fomit-frame-pointer -ffunction-sections -fdata-sections -pthread)
@@ -28,7 +29,7 @@ if(PIAI_NATIVE AND NOT CMAKE_CROSSCOMPILING)
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(armv6|armv6l|ARMv6|ARMv6l)$")
   target_compile_options(piai PRIVATE -mcpu=arm1176jzf-s -mtune=arm1176jzf-s -mfpu=vfp -mfloat-abi=hard -marm)
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(armv7|armv7l|ARMv7|ARMv7l)$")
-  target_compile_options(piai PRIVATE -mfpu=neon-vfpv4 -mfloat-abi=hard -marm)
+  target_compile_options(piai PRIVATE -mcpu=cortex-a7 -mtune=cortex-a7 -mfpu=neon-vfpv4 -mfloat-abi=hard -marm)
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
   target_compile_options(piai PRIVATE -march=armv8-a+simd)
 endif()
