@@ -21,12 +21,18 @@ add_custom_command(OUTPUT ${PAIBACKEND}
   DEPENDS ${PAIGEN} ${CMAKE_CURRENT_SOURCE_DIR}/tools/bind_compute_backend.py VERBATIM)
 add_custom_target(piai_inference_source DEPENDS ${PAIBACKEND})
 
+set(VC4KERNELS ${CMAKE_CURRENT_BINARY_DIR}/generated/vc4_kernels.hpp)
+add_custom_command(OUTPUT ${VC4KERNELS}
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/vc4_qpu_kernels.py ${VC4KERNELS}
+  DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tools/vc4_qpu_kernels.py VERBATIM)
+add_custom_target(piai_vc4_kernels DEPENDS ${VC4KERNELS})
+
 add_executable(piai
   src/main.cpp src/gguf_v3.cpp src/quant.cpp src/transformer.cpp src/api.cpp src/runtime.cpp
   src/platform.cpp src/platform/pi_models.cpp src/compute/dot.cpp src/compute/vc4_qpu.cpp
-  src/compute/vc4_memory.cpp src/compute/vc4_runtime.cpp
+  src/compute/vc4_memory.cpp src/compute/vc4_runtime.cpp src/compute/vc4_compute.cpp
   src/inference/cache.cpp src/inference/rope.cpp src/inference_parallel.cpp src/architecture_v2.cpp)
-add_dependencies(piai piai_inference_source)
+add_dependencies(piai piai_inference_source piai_vc4_kernels)
 target_include_directories(piai PRIVATE include ${CMAKE_CURRENT_BINARY_DIR}/generated)
 target_compile_options(piai PRIVATE -Wall -Wextra -Wpedantic -O3 -ffast-math -funsafe-math-optimizations -fno-math-errno -fno-trapping-math -ftree-vectorize -ftree-slp-vectorize -fomit-frame-pointer -ffunction-sections -fdata-sections -pthread)
 
