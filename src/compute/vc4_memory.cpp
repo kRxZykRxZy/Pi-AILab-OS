@@ -1,6 +1,5 @@
 #include "piai/compute/vc4_memory.hpp"
 
-#include <cerrno>
 #include <cstdint>
 #include <fcntl.h>
 #include <linux/ioctl.h>
@@ -43,7 +42,6 @@ uint32_t call1(int fd, uint32_t tag, uint32_t value) {
     m.value_bytes = 4;
     m.value_len = 4;
     m.value[0] = value;
-    m.end = 0;
     return property(fd, m) ? m.value[0] : 0;
 }
 
@@ -65,8 +63,6 @@ bool VC4Memory::allocate(size_t bytes, size_t alignment, bool coherent) {
     m.value_len = 12;
     m.value[0] = static_cast<uint32_t>((bytes + 4095u) & ~size_t(4095u));
     m.value[1] = static_cast<uint32_t>(alignment);
-    // Direct/coherent are documented VideoCore aliases. Permanent-lock avoids
-    // the buffer moving while its bus address is handed to QPU DMA.
     m.value[2] = (coherent ? kFlagCoherent : kFlagDirect) | kFlagPermanent;
     if (!property(mailbox_, m) || m.value[0] == 0) {
         ::close(mailbox_); mailbox_ = -1; return false;
@@ -76,8 +72,11 @@ bool VC4Memory::allocate(size_t bytes, size_t alignment, bool coherent) {
     if (bus_ == 0) { release(); return false; }
 
     const uintptr_t phys = static_cast<uintptr_t>(bus_ & ~kBusMask);
-    const size_t mapped = static_cast<size_t>((m.value[0] ? ((bytes + 4095u) & ~size_t(4095u)) : bytes));
-    cpu_ = mmap(nullptr, mapped, PROT_READ | PROT_WRITE, MAP_SHARED, ::open("/dev/mem", O_RDWR | O_SYNC), phys);
+    const size_t mapped = (bytes + 4095u) & ~size_t(4095u);
+    const int memfd = ::open("/dev/mem", O_RDWR | O_SYNC | O_CLOEXEC);
+    if (memfd < 0) { release(); return false; }
+    cpu_ = mmap(nullptr, mapped, PROT_READ | PROT_WRITE, MAP_SHARED, memfd, static_cast<off_t>(phys));
+    ::close(memfd);
     if (cpu_ == MAP_FAILED) cpu_ = nullptr;
     if (!cpu_) { release(); return false; }
     size_ = mapped;
