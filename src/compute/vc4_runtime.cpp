@@ -34,8 +34,6 @@ public:
         msg[3] = 4;
         msg[4] = 4;
         msg[5] = on ? 1u : 0u;
-        msg[6] = 0;
-        msg[7] = 0;
         return property(msg, 8) && msg[5] == 0;
     }
     bool execute(unsigned qpus, uint32_t control, unsigned timeout_ms) {
@@ -48,7 +46,6 @@ public:
         msg[6] = control;
         msg[7] = 0;
         msg[8] = timeout_ms;
-        msg[9] = 0;
         return property(msg, 10) && msg[5] == 0;
     }
 };
@@ -68,16 +65,17 @@ VC4RuntimeInfo vc4_runtime_info() {
 }
 
 bool vc4_execute_program(const uint8_t* code, size_t code_bytes,
-                         const uint32_t* uniforms, size_t uniform_words,
+                         const uint32_t* uniforms, size_t uniform_words_per_thread,
                          unsigned qpus, unsigned timeout_ms) {
-    if (!code || code_bytes == 0 || !uniforms || uniform_words == 0 || qpus == 0 || qpus > kMaxQpus)
-        return false;
+    if (!code || code_bytes == 0 || !uniforms || uniform_words_per_thread == 0 ||
+        qpus == 0 || qpus > kMaxQpus) return false;
 
     Mailbox mb;
     if (!mb.open() || !mb.enable(true)) return false;
 
     const size_t code_size = (code_bytes + 4095u) & ~size_t(4095u);
-    const size_t uniform_size = (uniform_words * sizeof(uint32_t) + 4095u) & ~size_t(4095u);
+    const size_t uniform_bytes = uniform_words_per_thread * sizeof(uint32_t);
+    const size_t uniform_size = (uniform_bytes * qpus + 4095u) & ~size_t(4095u);
     const size_t control_size = qpus * 2u * sizeof(uint32_t);
     VC4Memory code_mem, uniform_mem, control_mem;
     if (!code_mem.allocate(code_size, 4096, true) ||
@@ -85,22 +83,19 @@ bool vc4_execute_program(const uint8_t* code, size_t code_bytes,
         !control_mem.allocate(control_size, 4096, true)) return false;
 
     std::memcpy(code_mem.cpu_ptr(), code, code_bytes);
-    std::memcpy(uniform_mem.cpu_ptr(), uniforms, uniform_words * sizeof(uint32_t));
+    std::memcpy(uniform_mem.cpu_ptr(), uniforms, uniform_bytes * qpus);
     auto* control = static_cast<uint32_t*>(control_mem.cpu_ptr());
+    const uint32_t uniform_bus = uniform_mem.bus_address();
+    const uint32_t code_bus = code_mem.bus_address();
     for (unsigned i = 0; i < qpus; ++i) {
-        control[i * 2] = uniform_mem.bus_address();
-        control[i * 2 + 1] = code_mem.bus_address();
+        control[i * 2] = uniform_bus + static_cast<uint32_t>(i * uniform_bytes);
+        control[i * 2 + 1] = code_bus;
     }
-
-    // The QPU firmware consumes {uniform-address, code-address} pairs. All
-    // addresses here are VC bus addresses returned by the mailbox allocator;
-    // ARM virtual addresses are never passed to the GPU.
     return mb.execute(qpus, control_mem.bus_address(), timeout_ms ? timeout_ms : 1000);
 }
 
 bool vc4_runtime_self_test() {
-    const VC4RuntimeInfo info = vc4_runtime_info();
-    return info.qpu;
+    return vc4_runtime_info().qpu;
 }
 
 } // namespace piai::compute
