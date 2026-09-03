@@ -6,9 +6,15 @@ namespace piai::inference {
 
 bool KVCache::init(size_t l, size_t h, size_t d, size_t cap) {
     if (!l || !h || !d || !cap) return false;
-    if (l > SIZE_MAX / h || l * h > SIZE_MAX / d || l * h * d > SIZE_MAX / cap) return false;
-    const size_t n = l * cap * h * d;
+    size_t n = l;
+    if (n > SIZE_MAX / cap) return false;
+    n *= cap;
+    if (n > SIZE_MAX / h) return false;
+    n *= h;
+    if (n > SIZE_MAX / d) return false;
+    n *= d;
     if (n > std::vector<float>().max_size()) return false;
+
     k_.assign(n, 0.f);
     v_.assign(n, 0.f);
     layers_ = l;
@@ -20,8 +26,8 @@ bool KVCache::init(size_t l, size_t h, size_t d, size_t cap) {
 }
 
 void KVCache::clear() {
-    // Entries are overwritten before being observed during the next generation.
-    // Avoid touching the entire cache: this is especially important on Pi 2/3.
+    // Every used entry is overwritten before it is read on a new generation.
+    // Resetting the logical length avoids a full-cache memset on small Pis.
     used_ = 0;
 }
 
