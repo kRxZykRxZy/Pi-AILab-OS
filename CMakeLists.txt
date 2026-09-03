@@ -7,7 +7,9 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 option(PIAI_NATIVE "Tune for the CPU performing the build" ON)
+option(PIAI_VC4_GPU "Enable experimental VideoCore IV OpenCL backend when available" ON)
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
+
 set(PAIGEN ${CMAKE_CURRENT_BINARY_DIR}/generated/inference_v4.cpp)
 set(PAIBACKEND ${CMAKE_CURRENT_BINARY_DIR}/generated/inference_backend.cpp)
 add_custom_command(OUTPUT ${PAIGEN}
@@ -17,13 +19,15 @@ add_custom_command(OUTPUT ${PAIBACKEND}
   COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/bind_compute_backend.py ${PAIGEN} ${PAIBACKEND}
   DEPENDS ${PAIGEN} ${CMAKE_CURRENT_SOURCE_DIR}/tools/bind_compute_backend.py VERBATIM)
 add_custom_target(piai_inference_source DEPENDS ${PAIBACKEND})
+
 add_executable(piai
   src/main.cpp src/gguf_v3.cpp src/quant.cpp src/transformer.cpp src/api.cpp src/runtime.cpp
-  src/platform.cpp src/platform/pi_models.cpp src/compute/dot.cpp
+  src/platform.cpp src/platform/pi_models.cpp src/compute/dot.cpp src/compute/vc4.cpp
   src/inference/cache.cpp src/inference/rope.cpp src/inference_parallel.cpp src/architecture_v2.cpp)
 add_dependencies(piai piai_inference_source)
 target_include_directories(piai PRIVATE include ${CMAKE_CURRENT_BINARY_DIR}/generated)
 target_compile_options(piai PRIVATE -Wall -Wextra -Wpedantic -O3 -ffast-math -funsafe-math-optimizations -fno-math-errno -fno-trapping-math -ftree-vectorize -ftree-slp-vectorize -fomit-frame-pointer -ffunction-sections -fdata-sections -pthread)
+
 if(PIAI_NATIVE AND NOT CMAKE_CROSSCOMPILING)
   target_compile_options(piai PRIVATE -mcpu=native -mtune=native)
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(armv6|armv6l|ARMv6|ARMv6l)$")
@@ -33,6 +37,18 @@ elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(armv7|armv7l|ARMv7|ARMv7l)$")
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
   target_compile_options(piai PRIVATE -march=armv8-a+simd)
 endif()
+
+if(PIAI_VC4_GPU)
+  find_package(OpenCL QUIET)
+  if(OpenCL_FOUND)
+    target_compile_definitions(piai PRIVATE PIAI_HAVE_OPENCL=1)
+    target_link_libraries(piai PRIVATE OpenCL::OpenCL)
+    message(STATUS "Pi-AI Lab: VideoCore IV OpenCL backend enabled")
+  else()
+    message(STATUS "Pi-AI Lab: OpenCL headers/library not found; VC4 GPU backend will use CPU fallback")
+  endif()
+endif()
+
 target_link_options(piai PRIVATE -Wl,--gc-sections -pthread -Wl,--as-needed)
 if(UNIX)
   target_link_libraries(piai PRIVATE pthread m)
