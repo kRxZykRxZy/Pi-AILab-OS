@@ -1,0 +1,24 @@
+name: Inference optimization CI
+
+on:
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build-ci -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build-ci --parallel 2
+      - name: Verify optimization source
+        run: |
+          grep -q 'hardware_concurrency' tools/fix_inference_source.py
+          grep -q 'KV cache at the start' tools/fix_inference_source.py || true
+          grep -q 'correct_byte_encoder' src/inference_parallel.cpp
+          git diff --check
